@@ -2,6 +2,8 @@ lightning==2.0.9.post0
 lightning[pytorch-extra]
 pytorch-lightning==2.0.9.post0
 # fused-ssim should be installed separately with --no-build-isolation (see README.md)
+# diff_gaussian_rasterization은 graphdeco `dr_aa` 브랜치에서 별도 설치 필요 (README.md 참고)
+# CUDA 확장은 TORCH_CUDA_ARCH_LIST 명시가 필요할 수 있음 (README.md 참고)
 splines==0.3.0
 plyfile==0.8.1
 numpy==1.26.2

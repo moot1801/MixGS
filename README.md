@@ -52,8 +52,8 @@ mkdir output  # store your output here
 #### b. Create virtual environment
 ```bash
 # create virtual environment
-conda create -yn mixgs python=3.10 pip
-conda activate mixgs
+conda create -yn MGS python=3.10 pip
+conda activate MGS
 ```
 
 #### c. Install PyTorch
@@ -72,17 +72,20 @@ pip install -r requirements.txt
 pip install pytorch-lightning==2.0.9.post0
 # install fused-ssim with the commit used by upstream 3DGS for torch==2.0.1 compatibility
 pip install --no-build-isolation git+https://github.com/rahul-goel/fused-ssim.git@1272e21a282342e89537159e4bad508b19b34157
-pip install ninja git+https://github.com/hturki/tiny-cuda-nn.git@ht/res-grid#subdirectory=bindings/torch
-pip install submodules/diff-gaussian-rasterization
-pip install submodules/diff-gaussian-rasterization_filter
-pip install submodules/simple-knn
+pip install --no-build-isolation ninja git+https://github.com/hturki/tiny-cuda-nn.git@ht/res-grid#subdirectory=bindings/torch
+# CUDA arch 자동 감지가 실패하면 명시적으로 설정하세요 (예: RTX 3090 -> 8.6)
+export TORCH_CUDA_ARCH_LIST=<compute_capability>
+# 현재 MixGS 렌더러와 호환되는 AA + inverse-depth rasterizer를 사용합니다.
+pip install --no-build-isolation --no-cache-dir git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@dr_aa
+pip install --no-build-isolation submodules/diff-gaussian-rasterization_filter
+pip install --no-build-isolation submodules/simple-knn
 ```
 
 
 ### Training
 Take training the "Rubble Scene" as an example. Different scenes can be trained by changing the `config`.
 ```bash
-python train_mixgs.py --config config/rubble_mixgs.yaml
+TORCH_CUDA_ARCH_LIST=<compute_capability> python train_mixgs.py --config config/rubble_mixgs.yaml
 ```
 This script will also render and evaluate the result.
 
