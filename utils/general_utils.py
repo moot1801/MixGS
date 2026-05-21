@@ -167,6 +167,7 @@ def get_default_lp():
     lp.data_device = "cuda"
     lp.eval = False
     lp.llffhold = 8
+    lp.detail_max_slots = 1
     # data partitioning
     lp.pretrain_path = None  # path to coarse global model
     lp.num_threshold = 25_000  # threshold of point number
@@ -212,6 +213,15 @@ def get_default_pp():
     pp.convert_SHs_python = False
     pp.compute_cov3D_python = False
     pp.debug = False
+    pp.scale_min = 0.0
+    pp.render_gaussian_budget = 0
+    pp.stage_budget_adjustment = False
+    pp.stage_budget_initial_scale = 0.75
+    pp.stage_budget_min_scale = 0.10
+    pp.stage_budget_safety_scale = 0.95
+    pp.stage_budget_grow_factor = 1.02
+    pp.resource_log_interval = 0
+    pp.resource_plot_on_complete = False
 
     return pp
 

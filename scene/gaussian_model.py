@@ -56,9 +56,11 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, max_detail_slots: int = 1):
         self.opacity_thr = 0.5
-        self.n_offsets = 1
+        self.detail_slot_exponent = max(0, int(max_detail_slots))
+        self.max_detail_slots = 1 << self.detail_slot_exponent
+        self.n_offsets = self.max_detail_slots
 
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
@@ -126,8 +128,21 @@ class GaussianModel:
         return self._xyz
 
     @property
+    def get_offset_slots(self):
+        if self._offset.dim() == 2:
+            return self._offset.unsqueeze(1)
+        if self._offset.dim() == 3 and self._offset.shape[-1] == 3:
+            return self._offset
+        if self._offset.dim() == 3 and self._offset.shape[1] == 3:
+            return self._offset.transpose(1, 2).contiguous()
+        return self._offset
+
+    @property
     def get_offset(self):
-        return self._offset.squeeze()
+        offsets = self.get_offset_slots
+        if offsets.dim() == 3 and offsets.shape[1] == 1:
+            return offsets[:, 0]
+        return offsets
 
     @property
     def get_features(self):
@@ -209,7 +224,8 @@ class GaussianModel:
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
-        for i in range(self._offset.shape[1]*self._offset.shape[2]):
+        offsets = self.get_offset_slots
+        for i in range(offsets.shape[1]*offsets.shape[2]):
             l.append('f_offset_{}'.format(i))
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
@@ -226,7 +242,7 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        offset = self.get_offset_slots.detach().flatten(start_dim=1).contiguous().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -284,15 +300,23 @@ class GaussianModel:
 
         if "f_offset_0" in plydata.elements[0]:
             opa_flag = expit(opacities).squeeze() > 0.0
-            offsets = np.zeros((xyz[opa_flag].shape[0], self.n_offsets, 3))
-            offsets[:, self.n_offsets-1, 0] = np.asarray(plydata.elements[0]["f_offset_0"])
-            offsets[:, self.n_offsets-1, 1] = np.asarray(plydata.elements[0]["f_offset_1"])
-            offsets[:, self.n_offsets-1, 2] = np.asarray(plydata.elements[0]["f_offset_2"])
+            offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset_")]
+            offset_names = sorted(offset_names, key=lambda x: int(x.split('_')[-1]))
+            loaded_offsets = np.zeros((xyz[opa_flag].shape[0], len(offset_names)))
+            for idx, attr_name in enumerate(offset_names):
+                loaded_offsets[:, idx] = np.asarray(plydata.elements[0][attr_name])[opa_flag]
+            loaded_slots = max(1, len(offset_names) // 3)
+            offsets = loaded_offsets[:, :loaded_slots * 3].reshape(xyz[opa_flag].shape[0], loaded_slots, 3)
+            if loaded_slots < self.max_detail_slots:
+                pad = np.zeros((offsets.shape[0], self.max_detail_slots - loaded_slots, 3))
+                offsets = np.concatenate((offsets, pad), axis=1)
+            elif loaded_slots > self.max_detail_slots:
+                offsets = offsets[:, :self.max_detail_slots]
         else:
             opa_flag = expit(opacities).squeeze() > self.opacity_thr  # 0.05 0.5
-            offsets = torch.zeros((xyz[opa_flag].shape[0], self.n_offsets, 3)).float().cuda()
+            offsets = np.zeros((xyz[opa_flag].shape[0], self.max_detail_slots, 3))
 
-        self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").contiguous().requires_grad_(True))
 
         self._xyz = nn.Parameter(torch.tensor(xyz[opa_flag], dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc[opa_flag], dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))

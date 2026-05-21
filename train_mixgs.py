@@ -24,24 +24,103 @@ from utils.general_utils import safe_state, parse_cfg
 from tqdm import tqdm
 from os import makedirs
 from utils.image_utils import psnr
-from utils.log_utils import tensorboard_log_image, wandb_log_image
+from utils.log_utils import TrainingResourceLogger, tensorboard_log_image, wandb_log_image
 from argparse import ArgumentParser, Namespace
 from lpipsPyTorch import lpips
 from fused_ssim import fused_ssim
+
+
+class StageBudgetController:
+    def __init__(self, pipe, joint_start_iter):
+        self.enabled = bool(getattr(pipe, "stage_budget_adjustment", False))
+        self.base_budget = int(getattr(pipe, "render_gaussian_budget", 0) or 0)
+        self.joint_start_iter = int(joint_start_iter)
+        self.scale = self._clamp(float(getattr(pipe, "stage_budget_initial_scale", 0.75) or 0.75), 0.0, 1.0)
+        self.min_scale = self._clamp(float(getattr(pipe, "stage_budget_min_scale", 0.10) or 0.10), 0.0, 1.0)
+        self.safety_scale = self._clamp(float(getattr(pipe, "stage_budget_safety_scale", 0.95) or 0.95), 0.0, 1.0)
+        self.grow_factor = max(1.0, float(getattr(pipe, "stage_budget_grow_factor", 1.02) or 1.02))
+        self.reference_vram_mb = 0.0
+        self.observed_vram_mb = 0.0
+
+    @staticmethod
+    def _clamp(value, lower, upper):
+        return max(lower, min(value, upper))
+
+    def is_active(self, iteration):
+        return self.enabled and self.base_budget > 0 and iteration >= self.joint_start_iter
+
+    def current_scale(self, iteration):
+        if not self.is_active(iteration):
+            return 1.0
+        return self.scale
+
+    def budget_for(self, iteration):
+        if self.base_budget <= 0:
+            return 0
+        if not self.is_active(iteration):
+            return self.base_budget
+        return max(1, int(self.base_budget * self.scale))
+
+    def observe(self, iteration, observed_vram_mb):
+        if not self.enabled:
+            return
+        self.observed_vram_mb = float(observed_vram_mb or 0.0)
+        if self.observed_vram_mb <= 0:
+            return
+
+        if iteration < self.joint_start_iter:
+            if self.reference_vram_mb <= 0:
+                self.reference_vram_mb = self.observed_vram_mb
+            else:
+                self.reference_vram_mb = 0.1 * self.observed_vram_mb + 0.9 * self.reference_vram_mb
+            return
+
+        if self.reference_vram_mb <= 0:
+            return
+
+        target_vram_mb = self.reference_vram_mb * self.safety_scale
+        if self.observed_vram_mb > target_vram_mb:
+            shrink = self._clamp(target_vram_mb / max(self.observed_vram_mb, 1.0), self.min_scale, 1.0)
+            self.scale = self._clamp(self.scale * shrink, self.min_scale, 1.0)
+        elif self.observed_vram_mb < target_vram_mb * 0.95:
+            self.scale = self._clamp(self.scale * self.grow_factor, self.min_scale, 1.0)
+
+    def stats(self, effective_budget, used_scale):
+        if not self.enabled:
+            return {}
+        return {
+            "base_render_gaussian_budget": self.base_budget,
+            "effective_render_gaussian_budget": int(effective_budget),
+            "stage_budget_scale": float(used_scale),
+            "stage_budget_reference_vram_mb": float(self.reference_vram_mb),
+            "stage_budget_observed_vram_mb": float(self.observed_vram_mb),
+        }
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
              checkpoint, max_cache_num, debug_from):
     first_iter = 0
     log_writer, image_logger = prepare_output_and_logger(dataset)
+    resource_log_interval = int(getattr(pipe, "resource_log_interval", 0) or 0)
+    resource_plot_on_complete = bool(getattr(pipe, "resource_plot_on_complete", False))
+    resource_logger = None
+    if resource_log_interval > 0 and log_writer:
+        resource_logger = TrainingResourceLogger(
+            getattr(log_writer, "log_dir", None) or dataset.model_path,
+            getattr(dataset, "detail_max_slots", 1),
+        )
+    stage_budget_controller = StageBudgetController(pipe, getattr(opt, "joint_start_iter", opt.iterations + 1))
 
     modules = __import__('scene')
     model_config = dataset.model_config
-    gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_config['kwargs'])
+    model_kwargs = dict(model_config['kwargs'])
+    model_kwargs.setdefault("max_detail_slots", getattr(dataset, "detail_max_slots", 1))
+    gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_kwargs)
 
     mixgs = MixGSModel(
         hash_args=dataset.hash_args,
         net_args=dataset.network_args,
+        max_detail_slots=getattr(dataset, "detail_max_slots", 1),
     )
     mixgs.train_setting(opt)
 
@@ -77,6 +156,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             break
 
         for dataset_index, (cam_info, gt_image) in enumerate(data_loader):
+            should_log_resources = (
+                resource_logger is not None
+                and iteration % resource_log_interval == 0
+            )
+            if (should_log_resources or stage_budget_controller.enabled) and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             iter_start.record()
 
             # Render
@@ -84,12 +170,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             if (iteration - 1) == debug_from:
                 pipe.debug = True
 
-            vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
-            hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
-            decoded_data = mixgs.step(hash_input, cam_info['world_view_transform'][-1, :-1])
-
             if iteration == opt.joint_start_iter:
                 gaussians.gaussian_training()
+
+            effective_render_gaussian_budget = stage_budget_controller.budget_for(iteration)
+            stage_budget_scale = stage_budget_controller.current_scale(iteration)
+            vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
+            hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
+            decoded_data = mixgs.step(
+                hash_input,
+                cam_info['world_view_transform'][-1, :-1],
+                render_gaussian_budget=effective_render_gaussian_budget,
+                scale_min=getattr(pipe, "scale_min", 0.0),
+            )
 
             render_pkg = render_mix(cam_info, gaussians, pipe, background, vis_mask, decoded_data)
 
@@ -121,12 +214,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 
                 grads = gaussians.xyz_gradient_accum / gaussians.denom
                 grads[grads.isnan()] = 0.0
+                budget_stats = render_pkg.get("budget_stats", {})
+                observed_vram_mb = 0.0
+                if torch.cuda.is_available():
+                    observed_vram_mb = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+                stage_budget_controller.observe(iteration, observed_vram_mb)
+                budget_stats.update(stage_budget_controller.stats(effective_render_gaussian_budget, stage_budget_scale))
+                if should_log_resources:
+                    resource_logger.log(iteration, budget_stats, decoded_data.get("detail_counts"))
+
                 ema_time = {
                     "render": ema_time_render,
                     "loss": ema_time_loss,
                     "densify": ema_time_densify,
                     "num_points": radii.shape[0],
                     "mean_grad": grads.mean().item(),
+                    "visible_anchor_count": budget_stats.get("visible_anchor_count", 0),
+                    "detail_budget": budget_stats.get("detail_budget", 0),
+                    "selected_detail_count": budget_stats.get("selected_detail_count", 0),
+                    "render_gaussian_budget": budget_stats.get("render_gaussian_budget", 0),
+                    "budget_overflow": int(budget_stats.get("budget_overflow", False)),
+                    "base_render_gaussian_budget": budget_stats.get("base_render_gaussian_budget", 0),
+                    "effective_render_gaussian_budget": budget_stats.get("effective_render_gaussian_budget", 0),
+                    "stage_budget_scale": budget_stats.get("stage_budget_scale", 1.0),
+                    "stage_budget_reference_vram_mb": budget_stats.get("stage_budget_reference_vram_mb", 0),
+                    "stage_budget_observed_vram_mb": budget_stats.get("stage_budget_observed_vram_mb", 0),
                 }
 
                 lr = {}
@@ -166,6 +278,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             iteration += 1
             if iteration >= opt.iterations:
                 break
+
+    if resource_logger is not None and resource_plot_on_complete:
+        resource_logger.plot()
 
 
 def prepare_output_and_logger(args):
@@ -220,6 +335,20 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
             "train_time/mean_grad": ema_time["mean_grad"],
             "iter_time": elapsed,
         }
+        for key in (
+            "visible_anchor_count",
+            "detail_budget",
+            "selected_detail_count",
+            "render_gaussian_budget",
+            "budget_overflow",
+            "base_render_gaussian_budget",
+            "effective_render_gaussian_budget",
+            "stage_budget_scale",
+            "stage_budget_reference_vram_mb",
+            "stage_budget_observed_vram_mb",
+        ):
+            if key in ema_time:
+                metrics_to_log["train_budget/" + key] = ema_time[key]
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)
@@ -256,7 +385,12 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
 
                     hash_input = [scene.gaussians.get_xyz[vis_mask].detach(), scene.gaussians.get_scaling[vis_mask].detach(),
                                   scene.gaussians.get_rotation[vis_mask].detach()]
-                    decoded_data = mixgs.step(hash_input, viewpoint['world_view_transform'][-1, :-1])
+                    decoded_data = mixgs.step(
+                        hash_input,
+                        viewpoint['world_view_transform'][-1, :-1],
+                        render_gaussian_budget=getattr(renderArgs[0], "render_gaussian_budget", 0),
+                        scale_min=getattr(renderArgs[0], "scale_min", 0.0),
+                    )
 
                     render_pkg = render_mix(viewpoint, scene.gaussians, *renderArgs, vis_mask, decoded_data)
 

@@ -43,10 +43,13 @@ class GSDecoder(nn.Module):
             mlp_in_dim,
             depth=1,
             width=256,
+            max_detail_slots=1,
     ):
         super(GSDecoder, self).__init__()
         self.depth = depth
         self.width = width
+        self.detail_slot_exponent = max(0, int(max_detail_slots))
+        self.max_detail_slots = 1 << self.detail_slot_exponent
 
         self.spatial_mlp = nn.Sequential(
             nn.Linear(spatial_in_dim, width),
@@ -67,18 +70,35 @@ class GSDecoder(nn.Module):
         self.gaussian_rotation = nn.Linear(width, 4)
         self.gaussian_scaling = nn.Linear(width, 3)
         self.gaussian_opacity = nn.Linear(width, 1)
+        if self.max_detail_slots > 1:
+            self.slot_embedding = nn.Embedding(self.max_detail_slots, width)
+        else:
+            self.slot_embedding = None
 
-    def forward(self, spatial_h, pose_input, scale_input, rotate_input):
+    def compute_hidden(self, spatial_h, pose_input, scale_input, rotate_input):
         spatial_h = self.spatial_mlp(spatial_h)
         cat_feat = torch.cat([pose_input, scale_input, rotate_input], dim=1)
 
         cat_feat = self.mlp(cat_feat)
         h = spatial_h * (2 * torch.sigmoid(cat_feat) - 1)
         h = self.tiny_mlp(h)
+        return h
 
+    def proposal_score(self, h, scale_min=0.0):
+        scaling = torch.clamp_min(self.gaussian_scaling(h), scale_min)
+        opacity = torch.sigmoid(self.gaussian_opacity(h))
+        return opacity.squeeze(-1) * scaling.mean(dim=-1)
+
+    def decode_hidden(self, h, slot_idx=None):
+        if self.slot_embedding is not None and slot_idx is not None and h.shape[0] > 0:
+            h = h + self.slot_embedding(slot_idx)
         color = self.gaussian_color(h)
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)
         opacity = torch.sigmoid(self.gaussian_opacity(h))
 
         return color, rotation, scaling, opacity
+
+    def forward(self, spatial_h, pose_input, scale_input, rotate_input):
+        h = self.compute_hidden(spatial_h, pose_input, scale_input, rotate_input)
+        return self.decode_hidden(h)

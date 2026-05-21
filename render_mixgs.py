@@ -53,7 +53,12 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
         vis_mask = prefilter_voxel(cam_info, gaussians, pipeline, background)
 
         hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
-        decoded_data = mixgs.step(hash_input, cam_info['world_view_transform'][0][-1, :-1])
+        decoded_data = mixgs.step(
+            hash_input,
+            cam_info['world_view_transform'][0][-1, :-1],
+            render_gaussian_budget=getattr(pipeline, "render_gaussian_budget", 0),
+            scale_min=getattr(pipeline, "scale_min", 0.0),
+        )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 
         torch.cuda.synchronize()
@@ -81,7 +86,8 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             "Min FPS": 1/max_render_time,
             "Average Memory(M)": avg_memory/len(data_loader),
             "Max Memory(M)": max_memory,
-            "Number of Gaussians": gaussians.get_xyz.shape[0]
+            "Number of Gaussians": gaussians.get_xyz.shape[0],
+            "Render Gaussian Budget": getattr(pipeline, "render_gaussian_budget", 0)
         }, fp, indent=True)
     
     print(f'Average FPS: {len(data_loader)/avg_render_time:.4f}')
@@ -96,7 +102,9 @@ def render_sets(dataset : ModelParams, opt, iteration : int, pipeline : Pipeline
     with torch.no_grad():
         modules = __import__('scene')
         model_config = dataset.model_config
-        gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_config['kwargs'])
+        model_kwargs = dict(model_config['kwargs'])
+        model_kwargs.setdefault("max_detail_slots", getattr(dataset, "detail_max_slots", 1))
+        gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_kwargs)
 
         if custom_test:
             dataset.source_path = custom_test
@@ -106,6 +114,7 @@ def render_sets(dataset : ModelParams, opt, iteration : int, pipeline : Pipeline
         mixgs = MixGSModel(
             hash_args=dataset.hash_args,
             net_args=dataset.network_args,
+            max_detail_slots=getattr(dataset, "detail_max_slots", 1),
         )
         mixgs.load_weights(dataset.model_path, iteration)
 

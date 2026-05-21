@@ -80,8 +80,25 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     d_sh = decoded_data["d_color"].to(torch.float32)
     d_opacity = decoded_data["d_opacity"].to(torch.float32)
 
-    num = len(d_scaling)
-    means3D = ori_xyz + pc.get_offset[vis_mask].reshape(num, -1)
+    detail_anchor_idx = decoded_data.get("detail_anchor_idx")
+    detail_slot_idx = decoded_data.get("detail_slot_idx")
+    if detail_anchor_idx is None:
+        detail_anchor_idx = torch.arange(d_scaling.shape[0], device=ori_xyz.device, dtype=torch.long)
+    else:
+        detail_anchor_idx = detail_anchor_idx.to(device=ori_xyz.device, dtype=torch.long)
+    if detail_slot_idx is None:
+        detail_slot_idx = torch.zeros(d_scaling.shape[0], device=ori_xyz.device, dtype=torch.long)
+    else:
+        detail_slot_idx = detail_slot_idx.to(device=ori_xyz.device, dtype=torch.long)
+
+    if d_scaling.shape[0] > 0:
+        offset_slots = pc.get_offset_slots[vis_mask]
+        means3D = ori_xyz[detail_anchor_idx] + offset_slots[detail_anchor_idx, detail_slot_idx]
+        rotations = pc.rotation_activation(ori_rot[detail_anchor_idx] + d_rotation)
+    else:
+        means3D = ori_xyz.new_empty((0, 3))
+        rotations = ori_rot.new_empty((0, 4))
+    res_scales = torch.clamp_min(d_scaling, pipe.scale_min)
 
     # color pre compute
     pc_features = pc.get_features[vis_mask].transpose(1, 2)
@@ -93,8 +110,6 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
 
     colors_precomp = torch.cat([torch.sigmoid(d_sh), colors_precomp], dim=0)
     opacity = d_opacity
-    rotations = pc.rotation_activation(ori_rot + d_rotation)
-    res_scales = torch.clamp_min(d_scaling, pipe.scale_min)   # 0.002  0.0005
 
     ori_means3D = pc.get_xyz[vis_mask]
     ori_opacity = pc.get_opacity[vis_mask]
@@ -154,6 +169,5 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             "radii": radii,
             "depth": depth_image,
             "scale": res_scales,
+            "budget_stats": decoded_data.get("budget_stats", {}),
             }
-
-

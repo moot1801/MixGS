@@ -9,31 +9,163 @@ from utils.general_utils import get_expon_lr_func
 
 class MixGSModel:
     def __init__(
-            self, 
+            self,
             hash_args,
             net_args,
+            max_detail_slots=1,
     ):
         self.encoder = GSEncoder(**hash_args).cuda()
         self.spatial_dim = self.encoder.canonical_level_dim * self.encoder.canonical_num_levels
         self.mlp_dim = 10
+        self.detail_slot_exponent = max(0, int(max_detail_slots))
+        self.max_detail_slots = 1 << self.detail_slot_exponent
+        self.detail_count_choices = [1 << i for i in range(self.detail_slot_exponent + 1)]
+        net_args = dict(net_args)
+        net_args.setdefault("max_detail_slots", self.detail_slot_exponent)
         self.decoder = GSDecoder(spatial_in_dim=self.spatial_dim, mlp_in_dim=self.mlp_dim, **net_args).cuda()
 
         self.decoder_lr_scale = 50.0
         self.encoder_lr_scale = 100.0
 
-    def step(self, data, pose):
+    def _quantize_detail_counts(self, counts):
+        if counts.numel() == 0:
+            return counts
+        quantized = torch.zeros_like(counts)
+        for choice in self.detail_count_choices:
+            quantized = torch.where(counts >= choice, counts.new_full((), choice), quantized)
+        return quantized
+
+    def _allocate_detail_counts(self, scores, render_gaussian_budget):
+        visible_count = scores.shape[0]
+        device = scores.device
+        counts = torch.zeros(visible_count, dtype=torch.long, device=device)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+
+        if visible_count == 0:
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": 0,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": False,
+            }
+
+        if render_gaussian_budget <= 0:
+            counts.fill_(1)
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": visible_count,
+                "selected_detail_count": visible_count,
+                "budget_overflow": False,
+            }
+
+        detail_budget = max(render_gaussian_budget - visible_count, 0)
+        detail_budget = min(detail_budget, visible_count * self.max_detail_slots)
+        budget_overflow = visible_count > render_gaussian_budget
+        if detail_budget == 0:
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": budget_overflow,
+            }
+        if detail_budget == visible_count * self.max_detail_slots:
+            counts.fill_(self.max_detail_slots)
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": detail_budget,
+                "selected_detail_count": detail_budget,
+                "budget_overflow": budget_overflow,
+            }
+
+        scores = torch.clamp_min(scores, 0.0)
+        if scores.sum().item() <= 0.0:
+            scores = torch.ones_like(scores)
+        raw_counts = scores / scores.sum() * detail_budget
+        counts = torch.floor(raw_counts).to(torch.long).clamp(max=self.max_detail_slots)
+        counts = self._quantize_detail_counts(counts)
+
+        remaining = detail_budget - int(counts.sum().item())
+        for _ in self.detail_count_choices:
+            if remaining <= 0:
+                break
+            next_counts = torch.full_like(counts, self.max_detail_slots + 1)
+            for choice in self.detail_count_choices:
+                choice_tensor = counts.new_full(counts.shape, choice)
+                next_counts = torch.where((counts < choice) & (next_counts > choice), choice_tensor, next_counts)
+            increments = next_counts - counts
+            candidate_idx = torch.nonzero(
+                (next_counts <= self.max_detail_slots) & (increments > 0) & (increments <= remaining),
+                as_tuple=False,
+            ).flatten()
+            if candidate_idx.numel() == 0:
+                break
+            candidate_increments = increments[candidate_idx]
+            priorities = (raw_counts[candidate_idx] - counts[candidate_idx].to(raw_counts.dtype)) / candidate_increments.to(raw_counts.dtype)
+            order = torch.argsort(priorities, descending=True)
+            ordered_idx = candidate_idx[order]
+            ordered_increments = candidate_increments[order]
+            cumulative = torch.cumsum(ordered_increments, dim=0)
+            take_mask = cumulative <= remaining
+            if not torch.any(take_mask):
+                break
+            chosen = ordered_idx[take_mask]
+            counts[chosen] = next_counts[chosen]
+            remaining -= int(increments[chosen].sum().item())
+
+        selected_detail_count = int(counts.sum().item())
+        return counts, {
+            "render_gaussian_budget": render_gaussian_budget,
+            "visible_anchor_count": visible_count,
+            "detail_budget": detail_budget,
+            "selected_detail_count": selected_detail_count,
+            "budget_overflow": budget_overflow,
+        }
+
+    def _selected_indices_from_counts(self, counts):
+        anchor_count = counts.shape[0]
+        anchor_idx = torch.repeat_interleave(torch.arange(anchor_count, device=counts.device), counts)
+        if anchor_idx.numel() == 0:
+            return anchor_idx, torch.empty(0, dtype=torch.long, device=counts.device)
+        starts = torch.cumsum(counts, dim=0) - counts
+        slot_idx = torch.arange(anchor_idx.shape[0], device=counts.device) - torch.repeat_interleave(starts, counts)
+        return anchor_idx, slot_idx.to(torch.long)
+
+    def step(self, data, pose, render_gaussian_budget=0, scale_min=0.0):
         coords = data[0]
         scale_input = data[1]
         rotate_input = data[2]
 
         spatial_h, temporal_h = self.encoder(coords, pose)
-        color, rotation, scaling, opacity = self.decoder(spatial_h, temporal_h, scale_input, rotate_input)
-            
+        h = self.decoder.compute_hidden(spatial_h, temporal_h, scale_input, rotate_input)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        if render_gaussian_budget <= 0:
+            scores = h.new_ones(h.shape[0])
+        else:
+            scores = self.decoder.proposal_score(h, scale_min=scale_min)
+        detail_counts, budget_stats = self._allocate_detail_counts(scores, render_gaussian_budget)
+        anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
+
+        if anchor_idx.numel() > 0:
+            color, rotation, scaling, opacity = self.decoder.decode_hidden(h[anchor_idx], slot_idx)
+        else:
+            color = h.new_empty((0, 3))
+            rotation = h.new_empty((0, 4))
+            scaling = h.new_empty((0, 3))
+            opacity = h.new_empty((0, 1))
+
         return {
             "d_color": color,
-            "d_rotation": rotation, 
+            "d_rotation": rotation,
             "d_scaling": scaling,
             "d_opacity": opacity,
+            "detail_anchor_idx": anchor_idx,
+            "detail_slot_idx": slot_idx,
+            "detail_counts": detail_counts,
+            "budget_stats": budget_stats,
         }
     
     def train_setting(self, training_args):
@@ -81,7 +213,11 @@ class MixGSModel:
 
         print("Load weight:", weights_path)
         grid_weight, network_weight = torch.load(weights_path, map_location='cuda')
-        self.decoder.load_state_dict(network_weight)
+        try:
+            self.decoder.load_state_dict(network_weight)
+        except RuntimeError as exc:
+            print("Decoder state dict loaded with strict=False:", exc)
+            self.decoder.load_state_dict(network_weight, strict=False)
         self.encoder.load_state_dict(grid_weight)
 
     def update_learning_rate(self, iteration):

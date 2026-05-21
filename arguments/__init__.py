@@ -54,6 +54,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.detail_max_slots = 1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -66,6 +67,15 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.scale_min = 0.0
+        self.render_gaussian_budget = 0
+        self.stage_budget_adjustment = False
+        self.stage_budget_initial_scale = 0.75
+        self.stage_budget_min_scale = 0.10
+        self.stage_budget_safety_scale = 0.95
+        self.stage_budget_grow_factor = 1.02
+        self.resource_log_interval = 0
+        self.resource_plot_on_complete = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
