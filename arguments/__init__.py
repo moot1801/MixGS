@@ -55,6 +55,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.detail_max_slots = 1
+        self.detail_count_choices = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -69,13 +70,18 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.scale_min = 0.0
         self.render_gaussian_budget = 0
+        self.render_gaussian_budget_multiplier = 0.0
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10
         self.stage_budget_safety_scale = 0.95
         self.stage_budget_grow_factor = 1.02
+        self.stage_budget_decay_schedule = False
+        self.stage_budget_decay_iters = 20_000
         self.resource_log_interval = 0
         self.resource_plot_on_complete = False
+        self.metric_log_interval = 10_000
+        self.allocation_score = ""
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

@@ -66,7 +66,17 @@ def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.T
     return radii_pure > 0
 
 
-def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, vis_mask, decoded_data, scaling_modifier=1.0):
+def _residual_hw(rendered_image, gt_image):
+    if gt_image.dim() == 4:
+        gt_image = gt_image[0]
+    if rendered_image.dim() == 4:
+        rendered_image = rendered_image[0]
+    rendered_image = torch.clamp(rendered_image.detach(), 0.0, 1.0)
+    gt_image = torch.clamp(gt_image.detach().to(rendered_image.device), 0.0, 1.0)
+    return torch.mean(torch.abs(rendered_image - gt_image), dim=0).contiguous()
+
+
+def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, vis_mask, decoded_data, scaling_modifier=1.0, contribution_gt_image=None):
     """
     Render the scene.
 
@@ -161,6 +171,22 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
         rotations=rotations,
         cov3D_precomp=cov3D_precomp)
 
+    base_contribution_scores = None
+    if contribution_gt_image is not None and ori_xyz.shape[0] > 0:
+        residual_map = _residual_hw(rendered_image, contribution_gt_image)
+        base_contribution_scores = rasterizer.contribution_scores(
+            means3D=means3D,
+            opacities=opacity,
+            residual_map=residual_map,
+            target_start=int(d_scaling.shape[0]),
+            target_count=int(ori_xyz.shape[0]),
+            shs=None,
+            colors_precomp=colors_precomp,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp,
+        )
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -169,5 +195,6 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             "radii": radii,
             "depth": depth_image,
             "scale": res_scales,
+            "base_contribution_scores": base_contribution_scores,
             "budget_stats": decoded_data.get("budget_stats", {}),
             }

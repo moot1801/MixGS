@@ -52,6 +52,32 @@ namespace CudaRasterizer
 			int* radii = nullptr,
 			bool debug = false);
 
+		static int contributionScores(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			const float* residual,
+			const int target_start,
+			const int target_count,
+			float* out_scores,
+			int* radii = nullptr,
+			bool debug = false);
+
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,

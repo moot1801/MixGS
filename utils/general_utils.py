@@ -23,6 +23,61 @@ from matplotlib import cm
 from matplotlib.figure import Figure
 
 
+def _coerce_detail_choice_values(detail_count_choices):
+    if detail_count_choices is None:
+        return None
+    if isinstance(detail_count_choices, str):
+        stripped = detail_count_choices.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1]
+        values = [value.strip() for value in stripped.split(",") if value.strip()]
+    else:
+        try:
+            values = list(detail_count_choices)
+        except TypeError:
+            values = [detail_count_choices]
+
+    normalized = []
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError("detail_count_choices must contain integers, not booleans")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("detail_count_choices must contain integer values")
+        int_value = int(value)
+        if int_value < 0:
+            raise ValueError("detail_count_choices cannot contain negative values")
+        normalized.append(int_value)
+    return sorted(set(normalized))
+
+
+def resolve_detail_count_choices(detail_max_slots=1, detail_count_choices=None):
+    values = _coerce_detail_choice_values(detail_count_choices)
+    if values is None:
+        detail_slot_exponent = max(0, int(detail_max_slots or 0))
+        allocation_choices = [1 << i for i in range(detail_slot_exponent + 1)]
+    else:
+        allocation_choices = [value for value in values if value > 0]
+        if not allocation_choices:
+            raise ValueError("detail_count_choices must include at least one positive value")
+
+    logged_choices = sorted(set([0] + allocation_choices))
+    return max(allocation_choices), allocation_choices, logged_choices
+
+
+def resolve_render_gaussian_budget(render_gaussian_budget, visible_anchor_count, render_gaussian_budget_multiplier=0.0):
+    visible_anchor_count = int(visible_anchor_count)
+    render_gaussian_budget_multiplier = float(render_gaussian_budget_multiplier or 0.0)
+    if render_gaussian_budget_multiplier > 0:
+        return int(round(visible_anchor_count * render_gaussian_budget_multiplier))
+
+    render_gaussian_budget = int(render_gaussian_budget or 0)
+    if render_gaussian_budget == -1:
+        return visible_anchor_count * 2
+    return render_gaussian_budget
+
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -168,6 +223,7 @@ def get_default_lp():
     lp.eval = False
     lp.llffhold = 8
     lp.detail_max_slots = 1
+    lp.detail_count_choices = None
     # data partitioning
     lp.pretrain_path = None  # path to coarse global model
     lp.num_threshold = 25_000  # threshold of point number
@@ -215,13 +271,18 @@ def get_default_pp():
     pp.debug = False
     pp.scale_min = 0.0
     pp.render_gaussian_budget = 0
+    pp.render_gaussian_budget_multiplier = 0.0
     pp.stage_budget_adjustment = False
     pp.stage_budget_initial_scale = 0.75
     pp.stage_budget_min_scale = 0.10
     pp.stage_budget_safety_scale = 0.95
     pp.stage_budget_grow_factor = 1.02
+    pp.stage_budget_decay_schedule = False
+    pp.stage_budget_decay_iters = 20_000
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
+    pp.metric_log_interval = 10_000
+    pp.allocation_score = {"mode": "decoder"}
 
     return pp
 
@@ -231,7 +292,7 @@ def extract_args(params, cfg, args=None):
 
     if args is not None:
         for arg in vars(args).items():
-            if arg[0] in vars(params):
+            if arg[0] in vars(params) and arg[1] is not None:
                 setattr(params, arg[0], arg[1])
 
 

@@ -41,6 +41,53 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+def rasterize_gaussian_contribution_scores(
+    means3D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    rotations,
+    cov3Ds_precomp,
+    residual_map,
+    target_start,
+    target_count,
+    raster_settings,
+):
+    args = (
+        raster_settings.bg,
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        raster_settings.scale_modifier,
+        cov3Ds_precomp,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        sh,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        raster_settings.prefiltered,
+        residual_map,
+        int(target_start),
+        int(target_count),
+        raster_settings.debug,
+    )
+    if raster_settings.debug:
+        cpu_args = cpu_deep_copy_tuple(args)
+        try:
+            return _C.rasterize_gaussian_contribution_scores(*args)
+        except Exception as ex:
+            torch.save(cpu_args, "snapshot_contrib.dump")
+            print("\nAn error occured in contribution scoring. Writing snapshot_contrib.dump for debugging.")
+            raise ex
+    return _C.rasterize_gaussian_contribution_scores(*args)
+
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -217,5 +264,40 @@ class GaussianRasterizer(nn.Module):
             rotations,
             cov3D_precomp,
             raster_settings, 
+        )
+
+    def contribution_scores(
+            self, means3D, opacities, residual_map, target_start, target_count,
+            shs=None, colors_precomp=None, scales=None, rotations=None, cov3D_precomp=None):
+        raster_settings = self.raster_settings
+
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+        if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+        if scales is None:
+            scales = torch.Tensor([])
+        if rotations is None:
+            rotations = torch.Tensor([])
+        if cov3D_precomp is None:
+            cov3D_precomp = torch.Tensor([])
+
+        return rasterize_gaussian_contribution_scores(
+            means3D,
+            shs,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            cov3D_precomp,
+            residual_map,
+            target_start,
+            target_count,
+            raster_settings,
         )
 

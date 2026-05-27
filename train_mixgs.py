@@ -18,13 +18,14 @@ from gaussian_renderer import prefilter_voxel, render_mix
 import sys
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from scene import LargeScene, MixGSModel
+from scene.allocation_score import build_allocation_scorer
 from scene.datasets import GSDataset, CacheDataLoader
 from utils.camera_utils import loadCam
-from utils.general_utils import safe_state, parse_cfg
+from utils.general_utils import safe_state, parse_cfg, resolve_render_gaussian_budget
 from tqdm import tqdm
 from os import makedirs
 from utils.image_utils import psnr
-from utils.log_utils import TrainingResourceLogger, tensorboard_log_image, wandb_log_image
+from utils.log_utils import PerformanceMetricLogger, TrainingResourceLogger, tensorboard_log_image, wandb_log_image
 from argparse import ArgumentParser, Namespace
 from lpipsPyTorch import lpips
 from fused_ssim import fused_ssim
@@ -55,7 +56,9 @@ class StageBudgetController:
         return self.scale
 
     def budget_for(self, iteration):
-        if self.base_budget <= 0:
+        if self.base_budget < 0:
+            return self.base_budget
+        if self.base_budget == 0:
             return 0
         if not self.is_active(iteration):
             return self.base_budget
@@ -97,10 +100,170 @@ class StageBudgetController:
         }
 
 
+class StageBudgetDecaySchedule:
+    def __init__(self, pipe, max_detail_slots, joint_start_iter):
+        self.enabled = bool(getattr(pipe, "stage_budget_decay_schedule", False))
+        if self.enabled and bool(getattr(pipe, "stage_budget_adjustment", False)):
+            raise ValueError("stage_budget_decay_schedule cannot be used with stage_budget_adjustment")
+
+        self.max_detail_slots = max(1, int(max_detail_slots or 1))
+        self.joint_start_iter = int(joint_start_iter)
+        self.decay_iters = max(0, int(getattr(pipe, "stage_budget_decay_iters", 20_000) or 0))
+        self.detail_multiplier = 1.0 + float(self.max_detail_slots)
+        self.joint_multiplier = 1.0 + float(self.max_detail_slots) / 2.0
+
+    @property
+    def effective_joint_start_iter(self):
+        if not self.enabled:
+            return self.joint_start_iter
+        return self.joint_start_iter + self.decay_iters
+
+    def multiplier_for(self, iteration):
+        if not self.enabled:
+            return None
+
+        iteration = int(iteration)
+        if iteration < self.joint_start_iter:
+            return self.detail_multiplier
+        if self.decay_iters <= 0 or iteration >= self.effective_joint_start_iter:
+            return self.joint_multiplier
+
+        progress = float(iteration - self.joint_start_iter) / float(self.decay_iters)
+        progress = max(0.0, min(progress, 1.0))
+        return self.detail_multiplier + (self.joint_multiplier - self.detail_multiplier) * progress
+
+    def current_scale(self, iteration):
+        if not self.enabled:
+            return 1.0
+        return self.multiplier_for(iteration) / self.detail_multiplier
+
+    def budget_for(self, iteration, visible_anchor_count):
+        if not self.enabled:
+            return None
+        visible_anchor_count = int(visible_anchor_count)
+        return int(round(visible_anchor_count * self.multiplier_for(iteration)))
+
+    def stats(self, iteration, visible_anchor_count, effective_budget):
+        if not self.enabled:
+            return {}
+        base_budget = int(round(int(visible_anchor_count) * self.detail_multiplier))
+        return {
+            "base_render_gaussian_budget": base_budget,
+            "effective_render_gaussian_budget": int(effective_budget),
+            "stage_budget_scale": float(self.current_scale(iteration)),
+        }
+
+
+def _resolve_iteration_render_budget(pipe, visible_anchor_count, iteration, requested_render_gaussian_budget,
+                                     budget_decay_schedule=None):
+    if budget_decay_schedule is not None and budget_decay_schedule.enabled:
+        return budget_decay_schedule.budget_for(iteration, visible_anchor_count)
+    return resolve_render_gaussian_budget(
+        requested_render_gaussian_budget,
+        visible_anchor_count,
+        getattr(pipe, "render_gaussian_budget_multiplier", 0.0),
+    )
+
+
+def _camera_pose(viewpoint):
+    transform = viewpoint["world_view_transform"]
+    if isinstance(transform, torch.Tensor):
+        while transform.dim() > 2:
+            transform = transform[0]
+    return transform[-1, :-1]
+
+
+def _visible_hash_input(gaussians, vis_mask):
+    return [
+        gaussians.get_xyz[vis_mask].detach(),
+        gaussians.get_scaling[vis_mask].detach(),
+        gaussians.get_rotation[vis_mask].detach(),
+    ]
+
+
+def _render_with_allocation(
+        viewpoint, gt_image, gaussians, mixgs, pipe, background, vis_mask,
+        render_gaussian_budget, allocation_scorer, allow_residual_allocation,
+        iteration=None, joint_start_iter=None, anchor_indices=None, update_selection=False):
+    hash_input = _visible_hash_input(gaussians, vis_mask)
+    visible_xyz = hash_input[0]
+    proposal_scale_power = allocation_scorer.proposal_scale_power()
+    allocation_scores = allocation_scorer.initial_scores(
+        visible_xyz.shape[0], visible_xyz.device, visible_xyz.dtype,
+        iteration=iteration, joint_start_iter=joint_start_iter, anchor_indices=anchor_indices,
+    )
+    allocation_stats = {}
+
+    if (
+            allocation_scorer.requires_residual
+            and allocation_scorer.should_compute_residual(iteration, joint_start_iter)
+            and allow_residual_allocation
+            and gt_image is not None):
+        with torch.no_grad():
+            probe_data = mixgs.step(
+                hash_input,
+                _camera_pose(viewpoint),
+                render_gaussian_budget=render_gaussian_budget,
+                scale_min=getattr(pipe, "scale_min", 0.0),
+                allocation_scores=allocation_scores,
+                proposal_scale_power=proposal_scale_power,
+            )
+            probe_pkg = render_mix(
+                viewpoint,
+                gaussians,
+                pipe,
+                background,
+                vis_mask,
+                probe_data,
+                contribution_gt_image=gt_image,
+            )
+            allocation_scores = allocation_scorer.final_scores(
+                probe_pkg["render"],
+                gt_image,
+                viewpoint,
+                visible_xyz,
+                probe_data.get("proposal_scores"),
+                iteration=iteration,
+                joint_start_iter=joint_start_iter,
+                anchor_indices=anchor_indices,
+                contribution_scores=probe_pkg.get("base_contribution_scores"),
+            )
+        if allocation_scores is not None:
+            allocation_scores = allocation_scores.detach()
+        allocation_stats = allocation_scorer.score_stats(allocation_scores)
+
+    decoded_data = mixgs.step(
+        hash_input,
+        _camera_pose(viewpoint),
+        render_gaussian_budget=render_gaussian_budget,
+        scale_min=getattr(pipe, "scale_min", 0.0),
+        allocation_scores=allocation_scores,
+        proposal_scale_power=proposal_scale_power,
+    )
+    render_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, decoded_data)
+    if update_selection:
+        allocation_scorer.after_step(
+            decoded_data.get("detail_counts"),
+            anchor_indices=anchor_indices,
+            iteration=iteration,
+            joint_start_iter=joint_start_iter,
+        )
+    if not allocation_stats:
+        allocation_stats = allocation_scorer.score_stats(decoded_data.get("allocation_scores"))
+    return render_pkg, decoded_data, allocation_stats
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
-             checkpoint, max_cache_num, debug_from):
+             checkpoint, max_cache_num, debug_from, metric_log_interval):
     first_iter = 0
+    training_start_timestamp = time.time()
+    training_start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(training_start_timestamp))
     log_writer, image_logger = prepare_output_and_logger(dataset)
+    metric_logger = PerformanceMetricLogger(
+        getattr(log_writer, "log_dir", None) or dataset.model_path,
+        metric_log_interval,
+    )
+    detail_count_choices = getattr(dataset, "detail_count_choices", None)
     resource_log_interval = int(getattr(pipe, "resource_log_interval", 0) or 0)
     resource_plot_on_complete = bool(getattr(pipe, "resource_plot_on_complete", False))
     resource_logger = None
@@ -108,6 +271,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
         resource_logger = TrainingResourceLogger(
             getattr(log_writer, "log_dir", None) or dataset.model_path,
             getattr(dataset, "detail_max_slots", 1),
+            detail_count_choices,
         )
     stage_budget_controller = StageBudgetController(pipe, getattr(opt, "joint_start_iter", opt.iterations + 1))
 
@@ -115,14 +279,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     model_config = dataset.model_config
     model_kwargs = dict(model_config['kwargs'])
     model_kwargs.setdefault("max_detail_slots", getattr(dataset, "detail_max_slots", 1))
+    model_kwargs.setdefault("detail_count_choices", detail_count_choices)
     gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_kwargs)
 
     mixgs = MixGSModel(
         hash_args=dataset.hash_args,
         net_args=dataset.network_args,
         max_detail_slots=getattr(dataset, "detail_max_slots", 1),
+        detail_count_choices=detail_count_choices,
     )
+    budget_decay_schedule = StageBudgetDecaySchedule(
+        pipe,
+        mixgs.max_detail_slots,
+        getattr(opt, "joint_start_iter", opt.iterations + 1),
+    )
+    effective_joint_start_iter = budget_decay_schedule.effective_joint_start_iter
     mixgs.train_setting(opt)
+    allocation_scorer = build_allocation_scorer(getattr(pipe, "allocation_score", None))
 
     scene = LargeScene(dataset, gaussians)
     gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipe)
@@ -170,21 +343,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             if (iteration - 1) == debug_from:
                 pipe.debug = True
 
-            if iteration == opt.joint_start_iter:
+            if iteration == effective_joint_start_iter:
                 gaussians.gaussian_training()
 
-            effective_render_gaussian_budget = stage_budget_controller.budget_for(iteration)
+            requested_render_gaussian_budget = stage_budget_controller.budget_for(iteration)
             stage_budget_scale = stage_budget_controller.current_scale(iteration)
             vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
-            hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
-            decoded_data = mixgs.step(
-                hash_input,
-                cam_info['world_view_transform'][-1, :-1],
-                render_gaussian_budget=effective_render_gaussian_budget,
-                scale_min=getattr(pipe, "scale_min", 0.0),
+            visible_anchor_count = int(vis_mask.sum().item())
+            effective_render_gaussian_budget = _resolve_iteration_render_budget(
+                pipe,
+                visible_anchor_count,
+                iteration,
+                requested_render_gaussian_budget,
+                budget_decay_schedule,
             )
-
-            render_pkg = render_mix(cam_info, gaussians, pipe, background, vis_mask, decoded_data)
+            if budget_decay_schedule.enabled:
+                stage_budget_scale = budget_decay_schedule.current_scale(iteration)
+            gt_image = gt_image.cuda()
+            visible_anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
+            render_pkg, decoded_data, allocation_stats = _render_with_allocation(
+                cam_info,
+                gt_image,
+                gaussians,
+                mixgs,
+                pipe,
+                background,
+                vis_mask,
+                effective_render_gaussian_budget,
+                allocation_scorer,
+                True,
+                iteration=iteration,
+                joint_start_iter=effective_joint_start_iter,
+                anchor_indices=visible_anchor_indices,
+                update_selection=True,
+            )
 
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
                 "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -193,7 +385,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 
             # Loss
             start = time.time()
-            gt_image = gt_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
 
@@ -219,7 +410,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 if torch.cuda.is_available():
                     observed_vram_mb = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
                 stage_budget_controller.observe(iteration, observed_vram_mb)
-                budget_stats.update(stage_budget_controller.stats(effective_render_gaussian_budget, stage_budget_scale))
+                if budget_decay_schedule.enabled:
+                    budget_stats.update(
+                        budget_decay_schedule.stats(
+                            iteration,
+                            visible_anchor_count,
+                            effective_render_gaussian_budget,
+                        )
+                    )
+                else:
+                    budget_stats.update(stage_budget_controller.stats(effective_render_gaussian_budget, stage_budget_scale))
                 if should_log_resources:
                     resource_logger.log(iteration, budget_stats, decoded_data.get("detail_counts"))
 
@@ -239,6 +439,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "stage_budget_scale": budget_stats.get("stage_budget_scale", 1.0),
                     "stage_budget_reference_vram_mb": budget_stats.get("stage_budget_reference_vram_mb", 0),
                     "stage_budget_observed_vram_mb": budget_stats.get("stage_budget_observed_vram_mb", 0),
+                    "allocation_score": allocation_stats,
                 }
 
                 lr = {}
@@ -250,7 +451,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 
                 # Log and save
                 training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr,
-                                iter_start.elapsed_time(iter_end), testing_iterations, scene, mixgs, (pipe, background))
+                                iter_start.elapsed_time(iter_end), testing_iterations, scene, mixgs, (pipe, background),
+                                metric_logger, training_start_timestamp, training_start_time, allocation_scorer,
+                                effective_joint_start_iter, budget_decay_schedule)
 
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -281,6 +484,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 
     if resource_logger is not None and resource_plot_on_complete:
         resource_logger.plot()
+    if metric_logger is not None and metric_log_interval and metric_log_interval > 0:
+        metric_logger.plot()
 
 
 def prepare_output_and_logger(args):
@@ -323,7 +528,9 @@ def prepare_output_and_logger(args):
 
 
 def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr, elapsed,
-                    testing_iterations, scene: LargeScene, mixgs, renderArgs):
+                    testing_iterations, scene: LargeScene, mixgs, renderArgs, metric_logger,
+                    training_start_timestamp, training_start_time, allocation_scorer, joint_start_iter,
+                    budget_decay_schedule=None):
     if log_writer:
         metrics_to_log = {
             "train_loss_patches/l1_loss": Ll1.item(),
@@ -349,12 +556,15 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
         ):
             if key in ema_time:
                 metrics_to_log["train_budget/" + key] = ema_time[key]
+        for key, value in ema_time.get("allocation_score", {}).items():
+            metrics_to_log["allocation_score/" + key] = value
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)
 
     # Report test and samples of training set
-    if iteration in testing_iterations:
+    should_log_metrics = metric_logger is not None and metric_logger.should_log(iteration)
+    if iteration in testing_iterations or should_log_metrics:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
                               {'name': 'train',
@@ -363,6 +573,8 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
+                metric_start_timestamp = time.time()
+                metric_start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(metric_start_timestamp))
                 l1_test = 0.0
                 psnr_test = 0.0
                 ssims_test = 0.0
@@ -382,22 +594,35 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
                     org_img = viewpoint_cam.original_image
 
                     vis_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
-
-                    hash_input = [scene.gaussians.get_xyz[vis_mask].detach(), scene.gaussians.get_scaling[vis_mask].detach(),
-                                  scene.gaussians.get_rotation[vis_mask].detach()]
-                    decoded_data = mixgs.step(
-                        hash_input,
-                        viewpoint['world_view_transform'][-1, :-1],
-                        render_gaussian_budget=getattr(renderArgs[0], "render_gaussian_budget", 0),
-                        scale_min=getattr(renderArgs[0], "scale_min", 0.0),
+                    render_gaussian_budget = _resolve_iteration_render_budget(
+                        renderArgs[0],
+                        int(vis_mask.sum().item()),
+                        iteration,
+                        getattr(renderArgs[0], "render_gaussian_budget", 0),
+                        budget_decay_schedule,
                     )
 
-                    render_pkg = render_mix(viewpoint, scene.gaussians, *renderArgs, vis_mask, decoded_data)
+                    gt_image = torch.clamp(org_img.to("cuda"), 0.0, 1.0)
+                    visible_anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
+                    render_pkg, decoded_data, _ = _render_with_allocation(
+                        viewpoint,
+                        gt_image,
+                        scene.gaussians,
+                        mixgs,
+                        renderArgs[0],
+                        renderArgs[1],
+                        vis_mask,
+                        render_gaussian_budget,
+                        allocation_scorer,
+                        bool(getattr(renderArgs[0], "allocation_score_eval_uses_gt", False)),
+                        iteration=iteration,
+                        joint_start_iter=joint_start_iter,
+                        anchor_indices=visible_anchor_indices,
+                    )
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(org_img.to("cuda"), 0.0, 1.0)
 
-                    if log_writer and (idx < 5):
+                    if log_writer and (iteration in testing_iterations) and (idx < 5):
                         grid = torchvision.utils.make_grid(torch.concat([image, gt_image], dim=-1))
                         image_logger(
                             log_writer=log_writer,
@@ -415,15 +640,37 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
                 ssims_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])
 
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssims_test, lpips_test))
+                metric_end_timestamp = time.time()
+                metric_end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(metric_end_timestamp))
+                metric_elapsed_sec = metric_end_timestamp - metric_start_timestamp
+                elapsed_since_training_start_sec = metric_end_timestamp - training_start_timestamp
+                metrics = {
+                    "l1_loss": l1_test,
+                    "psnr": psnr_test,
+                    "ssim": ssims_test,
+                    "lpips": lpips_test,
+                }
+                metric_timing = {
+                    "training_start_time": training_start_time,
+                    "metric_start_time": metric_start_time,
+                    "metric_end_time": metric_end_time,
+                    "metric_elapsed_sec": metric_elapsed_sec,
+                    "elapsed_since_training_start_sec": elapsed_since_training_start_sec,
+                }
+                metrics_to_log = {
+                    config['name'] + '/loss_viewpoint/l1_loss': metrics["l1_loss"],
+                    config['name'] + '/loss_viewpoint/psnr': metrics["psnr"],
+                    config['name'] + '/loss_viewpoint/ssim': metrics["ssim"],
+                    config['name'] + '/loss_viewpoint/lpips': metrics["lpips"],
+                    config['name'] + '/metric_time/elapsed_sec': metric_elapsed_sec,
+                    config['name'] + '/metric_time/elapsed_since_training_start_sec': elapsed_since_training_start_sec,
+                }
+
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} EvalTime {:.2f}s".format(iteration, config['name'], l1_test, psnr_test, ssims_test, lpips_test, metric_elapsed_sec))
                 if log_writer:
-                    metrics_to_log = {
-                        config['name'] + '/loss_viewpoint/l1_loss': l1_test,
-                        config['name'] + '/loss_viewpoint/psnr': psnr_test,
-                        config['name'] + '/loss_viewpoint/ssim': ssims_test,
-                        config['name'] + '/loss_viewpoint/lpips': lpips_test,
-                    }
                     log_writer.log_metrics(metrics_to_log, iteration)
+                if should_log_metrics:
+                    metric_logger.log(iteration, config['name'], len(config['cameras']), metrics, metric_timing)
 
         torch.cuda.empty_cache()
 
@@ -446,6 +693,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--max_cache_num", type=int, default=32)
+    parser.add_argument("--metric_log_interval", type=int, default=None)
     args = parser.parse_args(sys.argv[1:])
     with open(args.config) as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
@@ -461,7 +709,8 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp, op, pp, args.test_iterations, args.save_iterations, args.refilter_iterations,
-             args.checkpoint_iterations, args.start_checkpoint, args.max_cache_num, args.debug_from)
+             args.checkpoint_iterations, args.start_checkpoint, args.max_cache_num, args.debug_from,
+             pp.metric_log_interval)
 
     # All done
     print("\nTraining complete.")
