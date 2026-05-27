@@ -216,6 +216,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* depth,
+	bool antialiasing,
 	int* radii,
 	bool debug)
 {
@@ -269,7 +271,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		antialiasing
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -330,7 +333,142 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color), debug)
+		out_color,
+		geomState.depths,
+		depth), debug)
+
+	return num_rendered;
+}
+
+int CudaRasterizer::Rasterizer::contributionScores(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	const bool antialiasing,
+	const float* residual,
+	const int target_start,
+	const int target_count,
+	float* out_scores,
+	int* radii,
+	bool debug)
+{
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	{
+		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	CHECK_CUDA(FORWARD::preprocess(
+		P, D, M,
+		means3D,
+		(glm::vec3*)scales,
+		scale_modifier,
+		(glm::vec4*)rotations,
+		opacities,
+		shs,
+		geomState.clamped,
+		cov3D_precomp,
+		colors_precomp,
+		viewmatrix, projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		radii,
+		geomState.means2D,
+		geomState.depths,
+		geomState.cov3D,
+		geomState.rgb,
+		geomState.conic_opacity,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered,
+		antialiasing
+	), debug)
+
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid)
+	CHECK_CUDA(, debug)
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemset(out_scores, 0, target_count * sizeof(float)), debug);
+
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	CHECK_CUDA(, debug)
+
+	CHECK_CUDA(FORWARD::scoreContributions(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		geomState.means2D,
+		geomState.conic_opacity,
+		residual,
+		target_start,
+		target_count,
+		out_scores), debug)
 
 	return num_rendered;
 }
@@ -344,6 +482,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* means3D,
 	const float* shs,
 	const float* colors_precomp,
+	const float* opacities,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -357,15 +496,18 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,
 	char* img_buffer,
 	const float* dL_dpix,
+	const float* dL_invdepths,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
+	float* dL_dinvdepth,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	bool antialiasing,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -397,13 +539,16 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.means2D,
 		geomState.conic_opacity,
 		color_ptr,
+		geomState.depths,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		dL_invdepths,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		dL_dinvdepth), debug);
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -414,6 +559,7 @@ void CudaRasterizer::Rasterizer::backward(
 		radii,
 		shs,
 		geomState.clamped,
+		opacities,
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
@@ -425,10 +571,13 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)campos,
 		(float3*)dL_dmean2D,
 		dL_dconic,
+		dL_dinvdepth,
+		dL_dopacity,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		antialiasing), debug);
 }

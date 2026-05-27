@@ -77,6 +77,8 @@ pip install --no-build-isolation ninja git+https://github.com/hturki/tiny-cuda-n
 export TORCH_CUDA_ARCH_LIST=<compute_capability>
 # 현재 MixGS 렌더러와 호환되는 AA + inverse-depth rasterizer를 사용합니다.
 pip install --no-build-isolation --no-cache-dir git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@dr_aa
+# residual contribution score 실험에서는 위 upstream 대신 로컬 패치 버전을 설치하세요.
+# pip install --no-build-isolation --no-cache-dir -e submodules/diff-gaussian-rasterization-aa
 pip install --no-build-isolation submodules/diff-gaussian-rasterization_filter
 pip install --no-build-isolation submodules/simple-knn
 ```
