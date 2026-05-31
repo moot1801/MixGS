@@ -33,7 +33,10 @@ class GSEncoder(nn.Module):
 
     def forward(self, coords, pose):
 
-        return self.xyz_encoding(coords, size=self.bound), pose.unsqueeze(0).repeat(coords.size()[0], 1)
+        return self.encode_xyz(coords), pose.unsqueeze(0).repeat(coords.size()[0], 1)
+
+    def encode_xyz(self, coords):
+        return self.xyz_encoding(coords, size=self.bound)
 
 
 class GSDecoder(nn.Module):
@@ -48,8 +51,7 @@ class GSDecoder(nn.Module):
         super(GSDecoder, self).__init__()
         self.depth = depth
         self.width = width
-        self.detail_slot_exponent = max(0, int(max_detail_slots))
-        self.max_detail_slots = 1 << self.detail_slot_exponent
+        self.max_detail_slots = max(1, int(max_detail_slots or 1))
 
         self.spatial_mlp = nn.Sequential(
             nn.Linear(spatial_in_dim, width),
@@ -70,10 +72,6 @@ class GSDecoder(nn.Module):
         self.gaussian_rotation = nn.Linear(width, 4)
         self.gaussian_scaling = nn.Linear(width, 3)
         self.gaussian_opacity = nn.Linear(width, 1)
-        if self.max_detail_slots > 1:
-            self.slot_embedding = nn.Embedding(self.max_detail_slots, width)
-        else:
-            self.slot_embedding = None
 
     def compute_hidden(self, spatial_h, pose_input, scale_input, rotate_input):
         spatial_h = self.spatial_mlp(spatial_h)
@@ -84,14 +82,15 @@ class GSDecoder(nn.Module):
         h = self.tiny_mlp(h)
         return h
 
-    def proposal_score(self, h, scale_min=0.0):
+    def proposal_score(self, h, scale_min=0.0, scale_power=1.0):
         scaling = torch.clamp_min(self.gaussian_scaling(h), scale_min)
+        scale_score = scaling.mean(dim=-1)
+        if scale_power != 1.0:
+            scale_score = torch.pow(torch.clamp_min(scale_score, 0.0), scale_power)
         opacity = torch.sigmoid(self.gaussian_opacity(h))
-        return opacity.squeeze(-1) * scaling.mean(dim=-1)
+        return opacity.squeeze(-1) * scale_score
 
     def decode_hidden(self, h, slot_idx=None):
-        if self.slot_embedding is not None and slot_idx is not None and h.shape[0] > 0:
-            h = h + self.slot_embedding(slot_idx)
         color = self.gaussian_color(h)
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)

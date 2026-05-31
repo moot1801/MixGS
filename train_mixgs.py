@@ -109,8 +109,12 @@ class StageBudgetDecaySchedule:
         self.max_detail_slots = max(1, int(max_detail_slots or 1))
         self.joint_start_iter = int(joint_start_iter)
         self.decay_iters = max(0, int(getattr(pipe, "stage_budget_decay_iters", 20_000) or 0))
+        min_detail_multiplier = getattr(pipe, "stage_budget_decay_min_detail_multiplier", None)
+        if min_detail_multiplier is None:
+            min_detail_multiplier = float(self.max_detail_slots) / 2.0
+        min_detail_multiplier = max(0.0, min(float(min_detail_multiplier), float(self.max_detail_slots)))
         self.detail_multiplier = 1.0 + float(self.max_detail_slots)
-        self.joint_multiplier = 1.0 + float(self.max_detail_slots) / 2.0
+        self.joint_multiplier = 1.0 + min_detail_multiplier
 
     @property
     def effective_joint_start_iter(self):
@@ -178,6 +182,7 @@ def _visible_hash_input(gaussians, vis_mask):
         gaussians.get_xyz[vis_mask].detach(),
         gaussians.get_scaling[vis_mask].detach(),
         gaussians.get_rotation[vis_mask].detach(),
+        gaussians.get_offset_slots[vis_mask].detach(),
     ]
 
 
