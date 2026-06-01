@@ -147,19 +147,24 @@ class MixGSModel:
             offset_slots = coords.new_zeros((coords.shape[0], 1, 3))
         offset_slots = offset_slots.to(device=coords.device, dtype=coords.dtype)
 
-        spatial_h, temporal_h = self.encoder(coords, pose)
-        h = self.decoder.compute_hidden(spatial_h, temporal_h, scale_input, rotate_input)
+        temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         render_gaussian_budget = int(render_gaussian_budget or 0)
-        proposal_scores = None
         if render_gaussian_budget <= 0:
-            scores = h.new_ones(h.shape[0])
+            scores = coords.new_ones(coords.shape[0])
         else:
-            proposal_scores = self.decoder.proposal_score(h, scale_min=scale_min, scale_power=proposal_scale_power)
             if allocation_scores is None:
-                scores = proposal_scores
+                with torch.no_grad():
+                    spatial_h = self.encoder.encode_xyz(coords)
+                    h = self.decoder.compute_hidden(spatial_h, temporal_h, scale_input, rotate_input)
+                    scores = self.decoder.proposal_score(
+                        h,
+                        scale_min=scale_min,
+                        scale_power=proposal_scale_power,
+                    )
+                scores = scores.detach()
             else:
-                scores = allocation_scores.to(device=h.device, dtype=h.dtype).flatten()
-                if scores.shape[0] != h.shape[0]:
+                scores = allocation_scores.detach().to(device=coords.device, dtype=coords.dtype).flatten()
+                if scores.shape[0] != coords.shape[0]:
                     raise ValueError("allocation_scores must match visible anchor count")
         detail_counts, budget_stats = self._allocate_detail_counts(scores, render_gaussian_budget)
         anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
@@ -175,10 +180,10 @@ class MixGSModel:
             )
             color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h)
         else:
-            color = h.new_empty((0, 3))
-            rotation = h.new_empty((0, 4))
-            scaling = h.new_empty((0, 3))
-            opacity = h.new_empty((0, 1))
+            color = coords.new_empty((0, 3))
+            rotation = coords.new_empty((0, 4))
+            scaling = coords.new_empty((0, 3))
+            opacity = coords.new_empty((0, 1))
 
         return {
             "d_color": color,
@@ -189,8 +194,6 @@ class MixGSModel:
             "detail_slot_idx": slot_idx,
             "detail_counts": detail_counts,
             "budget_stats": budget_stats,
-            "proposal_scores": proposal_scores,
-            "allocation_scores": scores,
         }
     
     def train_setting(self, training_args):

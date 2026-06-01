@@ -190,52 +190,20 @@ def _render_with_allocation(
         viewpoint, gt_image, gaussians, mixgs, pipe, background, vis_mask,
         render_gaussian_budget, allocation_scorer, allow_residual_allocation,
         iteration=None, joint_start_iter=None, anchor_indices=None, update_selection=False):
+    if allocation_scorer.requires_residual:
+        raise ValueError(
+            "Residual/hybrid allocation scorers are disabled in the proposal-only training path. "
+            "Use decoder/proposal or uniform allocation_score."
+        )
+
     hash_input = _visible_hash_input(gaussians, vis_mask)
-    visible_xyz = hash_input[0]
-    proposal_scale_power = allocation_scorer.proposal_scale_power()
     allocation_scores = allocation_scorer.initial_scores(
-        visible_xyz.shape[0], visible_xyz.device, visible_xyz.dtype,
+        hash_input[0].shape[0], hash_input[0].device, hash_input[0].dtype,
         iteration=iteration, joint_start_iter=joint_start_iter, anchor_indices=anchor_indices,
     )
-    allocation_stats = {}
-
-    if (
-            allocation_scorer.requires_residual
-            and allocation_scorer.should_compute_residual(iteration, joint_start_iter)
-            and allow_residual_allocation
-            and gt_image is not None):
-        with torch.no_grad():
-            probe_data = mixgs.step(
-                hash_input,
-                _camera_pose(viewpoint),
-                render_gaussian_budget=render_gaussian_budget,
-                scale_min=getattr(pipe, "scale_min", 0.0),
-                allocation_scores=allocation_scores,
-                proposal_scale_power=proposal_scale_power,
-            )
-            probe_pkg = render_mix(
-                viewpoint,
-                gaussians,
-                pipe,
-                background,
-                vis_mask,
-                probe_data,
-                contribution_gt_image=gt_image,
-            )
-            allocation_scores = allocation_scorer.final_scores(
-                probe_pkg["render"],
-                gt_image,
-                viewpoint,
-                visible_xyz,
-                probe_data.get("proposal_scores"),
-                iteration=iteration,
-                joint_start_iter=joint_start_iter,
-                anchor_indices=anchor_indices,
-                contribution_scores=probe_pkg.get("base_contribution_scores"),
-            )
-        if allocation_scores is not None:
-            allocation_scores = allocation_scores.detach()
-        allocation_stats = allocation_scorer.score_stats(allocation_scores)
+    if allocation_scores is not None:
+        allocation_scores = allocation_scores.detach()
+    allocation_stats = allocation_scorer.score_stats(allocation_scores)
 
     decoded_data = mixgs.step(
         hash_input,
@@ -243,7 +211,7 @@ def _render_with_allocation(
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
         allocation_scores=allocation_scores,
-        proposal_scale_power=proposal_scale_power,
+        proposal_scale_power=allocation_scorer.proposal_scale_power(),
     )
     render_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, decoded_data)
     if update_selection:
@@ -253,8 +221,6 @@ def _render_with_allocation(
             iteration=iteration,
             joint_start_iter=joint_start_iter,
         )
-    if not allocation_stats:
-        allocation_stats = allocation_scorer.score_stats(decoded_data.get("allocation_scores"))
     return render_pkg, decoded_data, allocation_stats
 
 
@@ -301,6 +267,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     effective_joint_start_iter = budget_decay_schedule.effective_joint_start_iter
     mixgs.train_setting(opt)
     allocation_scorer = build_allocation_scorer(getattr(pipe, "allocation_score", None))
+    if allocation_scorer.requires_residual:
+        raise ValueError(
+            "Residual/hybrid allocation scorers are disabled in the proposal-only training path. "
+            "Use decoder/proposal or uniform allocation_score."
+        )
 
     scene = LargeScene(dataset, gaussians)
     gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipe)
