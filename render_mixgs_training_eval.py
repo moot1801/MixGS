@@ -22,10 +22,9 @@ from arguments import ModelParams, PipelineParams
 from gaussian_renderer import prefilter_voxel
 from lpipsPyTorch import lpips
 from scene import LargeScene, MixGSModel
-from scene.allocation_score import build_allocation_scorer
 from train_mixgs import (
     StageBudgetDecaySchedule,
-    _render_with_allocation,
+    _render_with_proposal_budget,
     _resolve_iteration_render_budget,
 )
 from utils.camera_utils import loadCam
@@ -112,7 +111,6 @@ def render_training_eval_set(
         mixgs,
         pipeline,
         background,
-        allocation_scorer,
         budget_decay_schedule,
         joint_start_iter,
         output_suffix,
@@ -143,21 +141,14 @@ def render_training_eval_set(
             getattr(pipeline, "render_gaussian_budget", 0),
             budget_decay_schedule,
         )
-        visible_anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
-        render_pkg, decoded_data, _ = _render_with_allocation(
+        render_pkg, decoded_data = _render_with_proposal_budget(
             viewpoint,
-            gt_image,
             scene.gaussians,
             mixgs,
             pipeline,
             background,
             vis_mask,
             render_gaussian_budget,
-            allocation_scorer,
-            bool(getattr(pipeline, "allocation_score_eval_uses_gt", False)),
-            iteration=iteration,
-            joint_start_iter=joint_start_iter,
-            anchor_indices=visible_anchor_indices,
         )
         image = torch.clamp(render_pkg["render"], 0.0, 1.0)
         _save_render_outputs(base_dir, idx, image, gt_image, render_pkg["depth"])
@@ -229,7 +220,6 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
             detail_count_choices=detail_count_choices,
         )
         mixgs.load_weights(dataset.model_path, iteration)
-        allocation_scorer = build_allocation_scorer(getattr(pipeline, "allocation_score", None))
         budget_decay_schedule = StageBudgetDecaySchedule(
             pipeline,
             mixgs.max_detail_slots,
@@ -251,7 +241,6 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
                 mixgs,
                 pipeline,
                 background,
-                allocation_scorer,
                 budget_decay_schedule,
                 joint_start_iter,
                 output_suffix,
@@ -267,7 +256,6 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
                 mixgs,
                 pipeline,
                 background,
-                allocation_scorer,
                 budget_decay_schedule,
                 joint_start_iter,
                 output_suffix,

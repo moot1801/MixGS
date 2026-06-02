@@ -49,7 +49,7 @@ optim_params: {
     opacity_lr: 0.05,
     scaling_lr: 0.002,
     rotation_lr: 0.001,
-    percent_dense: 0.01,
+    # removed: percent_dense: 0.01,
     lambda_dssim: 0.2,
     opacity_thr: 0.5,
     encoder_lr_scale: 600,

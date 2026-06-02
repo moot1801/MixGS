@@ -20,7 +20,6 @@ import numpy as np
 from tqdm import tqdm
 from arguments import GroupParams
 from scene import LargeScene, MixGSModel
-from scene.allocation_score import build_allocation_scorer
 from scene.datasets import GSDataset
 from os import makedirs
 from gaussian_renderer import prefilter_voxel, render_mix
@@ -31,7 +30,7 @@ from torch.utils.data import DataLoader
 from utils.general_utils import parse_cfg, colorize, resolve_render_gaussian_budget
 
 
-def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeline, background, allocation_scorer):
+def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeline, background):
     avg_render_time = 0
     max_render_time = 0
     avg_memory = 0
@@ -64,16 +63,11 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             gaussians.get_rotation[vis_mask].detach(),
             gaussians.get_offset_slots[vis_mask].detach(),
         ]
-        allocation_scores = allocation_scorer.initial_scores(
-            hash_input[0].shape[0], hash_input[0].device, hash_input[0].dtype
-        )
         decoded_data = mixgs.step(
             hash_input,
             cam_info['world_view_transform'][0][-1, :-1],
             render_gaussian_budget=render_gaussian_budget,
             scale_min=getattr(pipeline, "scale_min", 0.0),
-            allocation_scores=allocation_scores,
-            proposal_scale_power=allocation_scorer.proposal_scale_power(),
         )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 
@@ -136,7 +130,6 @@ def render_sets(dataset : ModelParams, opt, iteration : int, pipeline : Pipeline
             detail_count_choices=detail_count_choices,
         )
         mixgs.load_weights(dataset.model_path, iteration)
-        allocation_scorer = build_allocation_scorer(getattr(pipeline, "allocation_score", None))
 
         print(f"Number of Gaussians: {gaussians.get_xyz.shape[0]}")
 
@@ -146,16 +139,16 @@ def render_sets(dataset : ModelParams, opt, iteration : int, pipeline : Pipeline
         if custom_test:
             views = scene.getTrainCameras() + scene.getTestCameras()
             gs_dataset = GSDataset(views, scene, dataset, pipeline)
-            render_set(dataset.model_path, filename, scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background, allocation_scorer)
+            render_set(dataset.model_path, filename, scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background)
             print("Skip both train and test, render all views")
         else:
             if not skip_train:
                 gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipeline)
-                render_set(dataset.model_path, "train", scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background, allocation_scorer)
+                render_set(dataset.model_path, "train", scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background)
 
             if not skip_test:
                 gs_dataset = GSDataset(scene.getTestCameras(), scene, dataset, pipeline)
-                render_set(dataset.model_path, "test", scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background, allocation_scorer)
+                render_set(dataset.model_path, "test", scene.loaded_iter, gs_dataset, gaussians, mixgs, pipeline, background)
 
 
 if __name__ == "__main__":

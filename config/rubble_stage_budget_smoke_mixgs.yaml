@@ -15,6 +15,7 @@ model_params: {
     eval: True,
     llffhold: None,
     detail_max_slots: 5,
+    detail_count_choices: [0, 1, 2, 4, 8, 16, 32],
     hash_args: {
         canonical_num_levels: 32,
         canonical_level_dim: 2,
@@ -36,7 +37,7 @@ pipeline_params: {
     debug:  False,
     scale_min: 0.0005,
     # Fixed base budget; effective budget is reduced after joint_start_iter.
-    render_gaussian_budget: 10000000,
+    render_gaussian_budget: 8388608,
     stage_budget_adjustment: True,
     stage_budget_initial_scale: 0.75,
     stage_budget_min_scale: 0.10,
@@ -48,18 +49,18 @@ pipeline_params: {
 
 # Optimization Parameters
 optim_params: {
-    iterations: 3_000,
-    joint_start_iter: 1_500,
+    iterations: 3_400,
+    joint_start_iter: 1_700,
     position_lr_init: 0.0000064,
     position_lr_final: 0.000000064,
     position_lr_delay_mult: 0.01,
-    position_lr_max_steps: 3_000,
-    decoder_lr_max_steps: 3_000,
+    position_lr_max_steps: 3_400,
+    decoder_lr_max_steps: 3_400,
     feature_lr: 0.00025,
     opacity_lr: 0.005,
     scaling_lr: 0.0005,
     rotation_lr: 0.0001,
-    percent_dense: 0.01,
+    # removed: percent_dense: 0.01,
     lambda_dssim: 0.2,
     opacity_thr: 0.5,
     encoder_lr_scale: 600.0,

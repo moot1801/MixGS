@@ -18,7 +18,6 @@ from gaussian_renderer import prefilter_voxel, render_mix
 import sys
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from scene import LargeScene, MixGSModel
-from scene.allocation_score import build_allocation_scorer
 from scene.datasets import GSDataset, CacheDataLoader
 from utils.camera_utils import loadCam
 from utils.general_utils import safe_state, parse_cfg, resolve_render_gaussian_budget
@@ -186,42 +185,17 @@ def _visible_hash_input(gaussians, vis_mask):
     ]
 
 
-def _render_with_allocation(
-        viewpoint, gt_image, gaussians, mixgs, pipe, background, vis_mask,
-        render_gaussian_budget, allocation_scorer, allow_residual_allocation,
-        iteration=None, joint_start_iter=None, anchor_indices=None, update_selection=False):
-    if allocation_scorer.requires_residual:
-        raise ValueError(
-            "Residual/hybrid allocation scorers are disabled in the proposal-only training path. "
-            "Use decoder/proposal or uniform allocation_score."
-        )
-
+def _render_with_proposal_budget(
+        viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget):
     hash_input = _visible_hash_input(gaussians, vis_mask)
-    allocation_scores = allocation_scorer.initial_scores(
-        hash_input[0].shape[0], hash_input[0].device, hash_input[0].dtype,
-        iteration=iteration, joint_start_iter=joint_start_iter, anchor_indices=anchor_indices,
-    )
-    if allocation_scores is not None:
-        allocation_scores = allocation_scores.detach()
-    allocation_stats = allocation_scorer.score_stats(allocation_scores)
-
     decoded_data = mixgs.step(
         hash_input,
         _camera_pose(viewpoint),
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
-        allocation_scores=allocation_scores,
-        proposal_scale_power=allocation_scorer.proposal_scale_power(),
     )
     render_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, decoded_data)
-    if update_selection:
-        allocation_scorer.after_step(
-            decoded_data.get("detail_counts"),
-            anchor_indices=anchor_indices,
-            iteration=iteration,
-            joint_start_iter=joint_start_iter,
-        )
-    return render_pkg, decoded_data, allocation_stats
+    return render_pkg, decoded_data
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
@@ -266,12 +240,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     )
     effective_joint_start_iter = budget_decay_schedule.effective_joint_start_iter
     mixgs.train_setting(opt)
-    allocation_scorer = build_allocation_scorer(getattr(pipe, "allocation_score", None))
-    if allocation_scorer.requires_residual:
-        raise ValueError(
-            "Residual/hybrid allocation scorers are disabled in the proposal-only training path. "
-            "Use decoder/proposal or uniform allocation_score."
-        )
 
     scene = LargeScene(dataset, gaussians)
     gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipe)
@@ -293,7 +261,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     ema_loss_for_log = 0.0
     ema_time_render = 0.0
     ema_time_loss = 0.0
-    ema_time_densify = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     iteration = first_iter
@@ -336,26 +303,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             if budget_decay_schedule.enabled:
                 stage_budget_scale = budget_decay_schedule.current_scale(iteration)
             gt_image = gt_image.cuda()
-            visible_anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
-            render_pkg, decoded_data, allocation_stats = _render_with_allocation(
+            render_pkg, decoded_data = _render_with_proposal_budget(
                 cam_info,
-                gt_image,
                 gaussians,
                 mixgs,
                 pipe,
                 background,
                 vis_mask,
                 effective_render_gaussian_budget,
-                allocation_scorer,
-                True,
-                iteration=iteration,
-                joint_start_iter=effective_joint_start_iter,
-                anchor_indices=visible_anchor_indices,
-                update_selection=True,
             )
 
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
-                "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            image, radii = render_pkg["render"], render_pkg["radii"]
             end = time.time()
             ema_time_render = 0.4 * (end - start) + 0.6 * ema_time_render
 
@@ -379,8 +337,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 if iteration == opt.iterations:
                     progress_bar.close()
 
-                grads = gaussians.xyz_gradient_accum / gaussians.denom
-                grads[grads.isnan()] = 0.0
                 budget_stats = render_pkg.get("budget_stats", {})
                 observed_vram_mb = 0.0
                 if torch.cuda.is_available():
@@ -402,9 +358,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 ema_time = {
                     "render": ema_time_render,
                     "loss": ema_time_loss,
-                    "densify": ema_time_densify,
                     "num_points": radii.shape[0],
-                    "mean_grad": grads.mean().item(),
                     "visible_anchor_count": budget_stats.get("visible_anchor_count", 0),
                     "detail_budget": budget_stats.get("detail_budget", 0),
                     "selected_detail_count": budget_stats.get("selected_detail_count", 0),
@@ -415,7 +369,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "stage_budget_scale": budget_stats.get("stage_budget_scale", 1.0),
                     "stage_budget_reference_vram_mb": budget_stats.get("stage_budget_reference_vram_mb", 0),
                     "stage_budget_observed_vram_mb": budget_stats.get("stage_budget_observed_vram_mb", 0),
-                    "allocation_score": allocation_stats,
                 }
 
                 lr = {}
@@ -428,7 +381,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 # Log and save
                 training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr,
                                 iter_start.elapsed_time(iter_end), testing_iterations, scene, mixgs, (pipe, background),
-                                metric_logger, training_start_timestamp, training_start_time, allocation_scorer,
+                                metric_logger, training_start_timestamp, training_start_time,
                                 effective_joint_start_iter, budget_decay_schedule)
 
                 if (iteration in saving_iterations):
@@ -505,7 +458,7 @@ def prepare_output_and_logger(args):
 
 def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr, elapsed,
                     testing_iterations, scene: LargeScene, mixgs, renderArgs, metric_logger,
-                    training_start_timestamp, training_start_time, allocation_scorer, joint_start_iter,
+                    training_start_timestamp, training_start_time, joint_start_iter,
                     budget_decay_schedule=None):
     if log_writer:
         metrics_to_log = {
@@ -513,9 +466,7 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
             "train_loss_patches/total_loss": loss.item(),
             "train_time/render": ema_time["render"],
             "train_time/loss": ema_time["loss"],
-            "train_time/densify": ema_time["densify"],
             "train_time/num_points": ema_time["num_points"],
-            "train_time/mean_grad": ema_time["mean_grad"],
             "iter_time": elapsed,
         }
         for key in (
@@ -532,8 +483,6 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
         ):
             if key in ema_time:
                 metrics_to_log["train_budget/" + key] = ema_time[key]
-        for key, value in ema_time.get("allocation_score", {}).items():
-            metrics_to_log["allocation_score/" + key] = value
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)
@@ -579,21 +528,14 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
                     )
 
                     gt_image = torch.clamp(org_img.to("cuda"), 0.0, 1.0)
-                    visible_anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
-                    render_pkg, decoded_data, _ = _render_with_allocation(
+                    render_pkg, decoded_data = _render_with_proposal_budget(
                         viewpoint,
-                        gt_image,
                         scene.gaussians,
                         mixgs,
                         renderArgs[0],
                         renderArgs[1],
                         vis_mask,
                         render_gaussian_budget,
-                        allocation_scorer,
-                        bool(getattr(renderArgs[0], "allocation_score_eval_uses_gt", False)),
-                        iteration=iteration,
-                        joint_start_iter=joint_start_iter,
-                        anchor_indices=visible_anchor_indices,
                     )
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)

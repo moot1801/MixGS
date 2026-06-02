@@ -5,6 +5,7 @@ import torch
 import wandb
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from utils.general_utils import resolve_detail_count_choices
 
 
 def tensorboard_log_image(log_writer, tag: str, image_tensor, step):
@@ -23,6 +24,149 @@ def wandb_log_image(log_writer, tag: str, image_tensor, step):
         image_dict,
         step=step,
     )
+
+
+
+class PerformanceMetricLogger:
+    TIMING_FIELDS = [
+        "training_start_time",
+        "metric_start_time",
+        "metric_end_time",
+        "metric_elapsed_sec",
+        "elapsed_since_training_start_sec",
+    ]
+    METRIC_FIELDS = [
+        "l1_loss",
+        "psnr",
+        "ssim",
+        "lpips",
+    ]
+    FIELDNAMES = [
+        "iteration",
+        "split",
+        "camera_count",
+    ] + TIMING_FIELDS + METRIC_FIELDS
+
+    def __init__(self, log_dir, interval=10000):
+        self.interval = int(interval or 0)
+        self.log_dir = os.path.join(log_dir, "metric_logs")
+        self.csv_path = os.path.join(self.log_dir, "training_metrics.csv")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._ensure_csv_path()
+
+    def should_log(self, iteration):
+        return self.interval > 0 and int(iteration) % self.interval == 0
+
+    def log(self, iteration, split, camera_count, metrics, timing=None):
+        row = {
+            "iteration": int(iteration),
+            "split": split,
+            "camera_count": int(camera_count),
+        }
+        timing = timing or {}
+        for field in self.TIMING_FIELDS:
+            row[field] = self._to_scalar(timing.get(field, ""))
+        for field in self.METRIC_FIELDS:
+            row[field] = self._to_scalar(metrics[field])
+
+        with open(self.csv_path, "a", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=self.FIELDNAMES)
+            writer.writerow(row)
+
+    def plot(self):
+        if not os.path.exists(self.csv_path):
+            return
+        with open(self.csv_path, "r", newline="") as csv_file:
+            rows = list(csv.DictReader(csv_file))
+        if not rows:
+            return
+
+        self._plot_panels(
+            rows,
+            self.METRIC_FIELDS,
+            "training_metrics_quality.png",
+            "Metric value",
+        )
+        self._plot_panels(
+            rows,
+            [
+                "metric_elapsed_sec",
+                "elapsed_since_training_start_sec",
+            ],
+            "training_metrics_timing.png",
+            "Seconds",
+        )
+
+    def _ensure_csv_path(self):
+        if not os.path.exists(self.csv_path):
+            self._write_header(self.csv_path)
+            return
+        if self._csv_header_matches(self.csv_path):
+            return
+
+        stem = "training_metrics"
+        candidate = os.path.join(self.log_dir, stem + "_1.csv")
+        index = 2
+        while os.path.exists(candidate) and not self._csv_header_matches(candidate):
+            candidate = os.path.join(self.log_dir, "{}_{}.csv".format(stem, index))
+            index += 1
+        self.csv_path = candidate
+        if not os.path.exists(self.csv_path):
+            self._write_header(self.csv_path)
+
+    def _csv_header_matches(self, csv_path):
+        with open(csv_path, "r", newline="") as csv_file:
+            reader = csv.reader(csv_file)
+            try:
+                return next(reader) == self.FIELDNAMES
+            except StopIteration:
+                return False
+
+    def _write_header(self, csv_path):
+        with open(csv_path, "w", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=self.FIELDNAMES)
+            writer.writeheader()
+
+    def _plot_panels(self, rows, fields, filename, ylabel):
+        split_rows = {}
+        for row in rows:
+            split_rows.setdefault(row.get("split", "unknown"), []).append(row)
+        for split in split_rows:
+            split_rows[split].sort(key=lambda row: int(row.get("iteration", 0) or 0))
+
+        column_count = 2
+        row_count = (len(fields) + column_count - 1) // column_count
+        fig = Figure(figsize=(12, 4 * row_count), dpi=150)
+        canvas = FigureCanvasAgg(fig)
+        for index, field in enumerate(fields):
+            ax = fig.add_subplot(row_count, column_count, index + 1)
+            for split, split_data in split_rows.items():
+                if field not in split_data[0]:
+                    continue
+                iterations = [int(row.get("iteration", 0) or 0) for row in split_data]
+                values = [float(row.get(field, 0) or 0) for row in split_data]
+                ax.plot(iterations, values, marker="o", linewidth=1.5, markersize=3, label=split)
+            ax.set_title(field)
+            ax.set_xlabel("iteration")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+
+        for index in range(len(fields), row_count * column_count):
+            ax = fig.add_subplot(row_count, column_count, index + 1)
+            ax.axis("off")
+
+        fig.tight_layout()
+        canvas.print_png(os.path.join(self.log_dir, filename))
+
+    @staticmethod
+    def _to_scalar(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.numel() == 1:
+                return value.item()
+            return value.cpu().tolist()
+        return value
 
 
 class TrainingResourceLogger:
@@ -48,12 +192,12 @@ class TrainingResourceLogger:
         "vram_total_mb",
     ]
 
-    def __init__(self, log_dir, detail_max_slots):
+    def __init__(self, log_dir, detail_max_slots, detail_count_choices=None):
         self.log_dir = os.path.join(log_dir, "resource_logs")
         self.csv_path = os.path.join(self.log_dir, "training_resources.csv")
-        self.detail_slot_exponent = max(0, int(detail_max_slots))
-        self.detail_max_slots = 1 << self.detail_slot_exponent
-        self.detail_count_choices = [0] + [1 << i for i in range(self.detail_slot_exponent + 1)]
+        self.detail_max_slots, _, self.detail_count_choices = resolve_detail_count_choices(
+            detail_max_slots, detail_count_choices
+        )
         self.detail_fields = [
             "detail_count_{}".format(slot_count)
             for slot_count in self.detail_count_choices
@@ -69,7 +213,9 @@ class TrainingResourceLogger:
             self._write_header(self.csv_path)
             return
 
-        stem = "training_resources_slots_{}".format(self.detail_max_slots)
+        stem = "training_resources_choices_{}".format(
+            "_".join(str(choice) for choice in self.detail_count_choices)
+        )
         candidate = os.path.join(self.log_dir, stem + ".csv")
         index = 1
         while os.path.exists(candidate) and not self._csv_header_matches(candidate):

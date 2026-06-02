@@ -253,13 +253,7 @@ def get_default_op():
     op.opacity_lr = 0.05
     op.scaling_lr = 0.005
     op.rotation_lr = 0.001
-    op.percent_dense = 0.01
     op.lambda_dssim = 0.2
-    op.densification_interval = 100
-    op.opacity_reset_interval = 3000
-    op.densify_from_iter = 500
-    op.densify_until_iter = 15_000
-    op.densify_grad_threshold = 0.0002
     op.max_cache_num = 512
 
     return op
@@ -279,10 +273,10 @@ def get_default_pp():
     pp.stage_budget_grow_factor = 1.02
     pp.stage_budget_decay_schedule = False
     pp.stage_budget_decay_iters = 20_000
+    pp.stage_budget_decay_min_detail_multiplier = None
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
     pp.metric_log_interval = 10_000
-    pp.allocation_score = {"mode": "decoder"}
 
     return pp
 

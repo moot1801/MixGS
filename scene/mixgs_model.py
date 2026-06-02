@@ -137,7 +137,7 @@ class MixGSModel:
         slot_idx = torch.arange(anchor_idx.shape[0], device=counts.device) - torch.repeat_interleave(starts, counts)
         return anchor_idx, slot_idx.to(torch.long)
 
-    def step(self, data, pose, render_gaussian_budget=0, scale_min=0.0, allocation_scores=None, proposal_scale_power=1.0):
+    def step(self, data, pose, render_gaussian_budget=0, scale_min=0.0):
         coords = data[0]
         scale_input = data[1]
         rotate_input = data[2]
@@ -149,23 +149,17 @@ class MixGSModel:
 
         temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         render_gaussian_budget = int(render_gaussian_budget or 0)
-        if render_gaussian_budget <= 0:
+        full_detail_budget = coords.shape[0] * self.max_detail_slots
+        if render_gaussian_budget > 0 and max(render_gaussian_budget - coords.shape[0], 0) >= full_detail_budget:
+            scores = coords.new_empty(coords.shape[0])
+        elif render_gaussian_budget <= 0:
             scores = coords.new_ones(coords.shape[0])
         else:
-            if allocation_scores is None:
-                with torch.no_grad():
-                    spatial_h = self.encoder.encode_xyz(coords)
-                    h = self.decoder.compute_hidden(spatial_h, temporal_h, scale_input, rotate_input)
-                    scores = self.decoder.proposal_score(
-                        h,
-                        scale_min=scale_min,
-                        scale_power=proposal_scale_power,
-                    )
-                scores = scores.detach()
-            else:
-                scores = allocation_scores.detach().to(device=coords.device, dtype=coords.dtype).flatten()
-                if scores.shape[0] != coords.shape[0]:
-                    raise ValueError("allocation_scores must match visible anchor count")
+            with torch.no_grad():
+                spatial_h = self.encoder.encode_xyz(coords)
+                h = self.decoder.compute_hidden(spatial_h, temporal_h, scale_input, rotate_input)
+                scores = self.decoder.proposal_score(h, scale_min=scale_min)
+            scores = scores.detach()
         detail_counts, budget_stats = self._allocate_detail_counts(scores, render_gaussian_budget)
         anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
 
