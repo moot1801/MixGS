@@ -1,0 +1,81 @@
+# Model Parameters
+model_params: {
+    model_config: {
+        name: "GaussianModel",
+        kwargs: {}
+    },
+    sh_degree: 3,
+    source_path: "data/mill19/rubble-pixsfm/train",
+    pretrain_path: "data/coarse_gaussians/rubble_point_cloud.ply",
+    model_path: "output/rubble_twopass_hybrid_budget_m1",
+    images: "images",
+    resolution: 4,
+    white_background: False,
+    data_device: "cuda",
+    eval: True,
+    llffhold: None, # 83,
+    # Same total detail budget as MixGS when render_gaussian_budget=-1.
+    # The allocation policy may assign 0/1/2/3 detail Gaussians per visible anchor.
+    detail_max_slots: 3,
+    detail_count_choices: [0, 1, 2, 3],
+    hash_args: {
+        canonical_num_levels: 32,
+        canonical_level_dim: 2,
+        canonical_base_resolution: 32,
+        canonical_desired_resolution: 2048,
+        canonical_log2_hashmap_size: 22,
+        bound: 202.19
+    },
+    network_args: {
+      depth: 1,
+      width: 32,
+    }
+}
+
+# Pipeline Parameters
+pipeline_params: {
+    convert_SHs_python:  False,
+    compute_cov3D_python:  False,
+    debug:  False,
+    scale_min: 0.0005,
+    # budget=-1 resolves to 2 * visible_anchor_count at each step.
+    # Therefore detail_budget == visible_anchor_count, matching MixGS detail count.
+    render_gaussian_budget: -1,
+    stage_budget_adjustment: False,
+    resource_log_interval: 100,
+    resource_plot_on_complete: True,
+    metric_log_interval: 10_000,
+    # Two-pass residual experiment:
+    # 1) probe render with decoder proposal allocation
+    # 2) compute view-local residual patch scores
+    # 3) allocate the same detail budget using decoder proposal * residual correction
+    # removed: allocation_score: {
+        # removed: mode: "hybrid",
+        # removed: residual_patch_size: 7,
+        # removed: residual_pooling: "mean",
+        # removed: residual_normalize: "mean",
+        # removed: residual_alpha: 0.5,
+        # removed: decoder_beta: 1.0,
+    # removed: },
+}
+
+
+# Optimization Parameters
+optim_params: {
+    iterations: 250_000,
+    joint_start_iter: 50_000,
+    position_lr_init: 0.0000064,
+    position_lr_final: 0.000000064,
+    position_lr_delay_mult: 0.01,
+    position_lr_max_steps: 250_000,
+    decoder_lr_max_steps: 250_000,
+    feature_lr: 0.00025,
+    opacity_lr: 0.005,
+    scaling_lr: 0.0005,
+    rotation_lr: 0.0001,
+    # removed: percent_dense: 0.01,
+    lambda_dssim: 0.2,
+    opacity_thr: 0.5,
+    encoder_lr_scale: 600.0,
+    decoder_lr_scale: 80.0,
+}
