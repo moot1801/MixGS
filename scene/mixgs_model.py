@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scene.network import GSDecoder, GSEncoder
+from scene.gate_allocation import GateAllocator
 import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func, resolve_detail_count_choices
@@ -24,6 +25,9 @@ class MixGSModel:
         net_args = dict(net_args)
         net_args["max_detail_slots"] = self.max_detail_slots
         self.decoder = GSDecoder(spatial_in_dim=self.spatial_dim, mlp_in_dim=self.mlp_dim, **net_args).cuda()
+        self.gate_feature_dim = self.spatial_dim + 3
+        self.gate_allocator = GateAllocator(self.gate_feature_dim).cuda()
+        self._gate_used = False
 
         self.decoder_lr_scale = 50.0
         self.encoder_lr_scale = 100.0
@@ -137,16 +141,55 @@ class MixGSModel:
         slot_idx = torch.arange(anchor_idx.shape[0], device=counts.device) - torch.repeat_interleave(starts, counts)
         return anchor_idx, slot_idx.to(torch.long)
 
-    def step(self, data, pose, render_gaussian_budget=0, scale_min=0.0):
-        coords = data[0]
-        scale_input = data[1]
-        rotate_input = data[2]
-        if len(data) > 3:
-            offset_slots = data[3]
-        else:
-            offset_slots = coords.new_zeros((coords.shape[0], 1, 3))
-        offset_slots = offset_slots.to(device=coords.device, dtype=coords.dtype)
+    def _empty_decoded_data(self, coords, detail_counts, budget_stats, gate_losses=None):
+        decoded = {
+            "d_color": coords.new_empty((0, 3)),
+            "d_rotation": coords.new_empty((0, 4)),
+            "d_scaling": coords.new_empty((0, 3)),
+            "d_opacity": coords.new_empty((0, 1)),
+            "detail_anchor_idx": torch.empty(0, dtype=torch.long, device=coords.device),
+            "detail_slot_idx": torch.empty(0, dtype=torch.long, device=coords.device),
+            "detail_counts": detail_counts,
+            "budget_stats": budget_stats,
+        }
+        if gate_losses is not None:
+            decoded["gate_losses"] = gate_losses
+        return decoded
 
+    def _zero_gate_losses(self, coords):
+        zero = coords.new_zeros(())
+        return {"loss": zero, "budget": zero, "binary": zero}
+
+    @staticmethod
+    def _gate_all_detail_warmup_active(training, iteration, all_detail_until):
+        if not training:
+            return False
+        all_detail_until = int(all_detail_until or 0)
+        if all_detail_until <= 0 or iteration is None:
+            return False
+        return int(iteration) <= all_detail_until
+
+    def _gate_input_feature(self, detail_spatial_h, candidate_xyz, camera_center, gate_feature_mode):
+        mode = str(gate_feature_mode or "detail_view").lower()
+        spatial_feature = detail_spatial_h.detach()
+        if mode in ("detail_only", "detail"):
+            view_dir = spatial_feature.new_zeros((spatial_feature.shape[0], 3))
+        elif mode in ("detail_view", "detail+view"):
+            if camera_center is None:
+                view_dir = spatial_feature.new_zeros((spatial_feature.shape[0], 3))
+            else:
+                if not isinstance(camera_center, torch.Tensor):
+                    camera_center = spatial_feature.new_tensor(camera_center)
+                camera_center = camera_center.to(device=spatial_feature.device, dtype=spatial_feature.dtype)
+                while camera_center.dim() > 1:
+                    camera_center = camera_center[0]
+                view_dir = F.normalize(camera_center.unsqueeze(0) - candidate_xyz.detach(), dim=-1, eps=1e-6)
+                view_dir = view_dir.detach()
+        else:
+            raise ValueError(f"Unsupported gate_feature_mode: {gate_feature_mode}")
+        return torch.cat([spatial_feature, view_dir], dim=-1)
+
+    def _step_proposal(self, coords, scale_input, rotate_input, offset_slots, pose, render_gaussian_budget=0, scale_min=0.0):
         temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         render_gaussian_budget = int(render_gaussian_budget or 0)
         full_detail_budget = coords.shape[0] * self.max_detail_slots
@@ -161,6 +204,7 @@ class MixGSModel:
                 scores = self.decoder.proposal_score(h, scale_min=scale_min)
             scores = scores.detach()
         detail_counts, budget_stats = self._allocate_detail_counts(scores, render_gaussian_budget)
+        budget_stats["allocation_mode_id"] = 0.0
         anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
 
         if anchor_idx.numel() > 0:
@@ -174,10 +218,7 @@ class MixGSModel:
             )
             color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h)
         else:
-            color = coords.new_empty((0, 3))
-            rotation = coords.new_empty((0, 4))
-            scaling = coords.new_empty((0, 3))
-            opacity = coords.new_empty((0, 1))
+            return self._empty_decoded_data(coords, detail_counts, budget_stats)
 
         return {
             "d_color": color,
@@ -189,7 +230,264 @@ class MixGSModel:
             "detail_counts": detail_counts,
             "budget_stats": budget_stats,
         }
-    
+
+    def _gate_budget_stats(
+            self,
+            render_gaussian_budget,
+            visible_count,
+            detail_budget,
+            selected_count,
+            budget_overflow,
+            gate_stats=None,
+            allocation_warmup_active=False,
+    ):
+        stats = {
+            "render_gaussian_budget": int(render_gaussian_budget or 0),
+            "visible_anchor_count": int(visible_count),
+            "detail_budget": int(detail_budget),
+            "selected_detail_count": int(selected_count),
+            "budget_overflow": bool(budget_overflow),
+            "allocation_mode_id": 1.0,
+            "allocation_warmup_active": float(bool(allocation_warmup_active)),
+        }
+        if gate_stats:
+            stats.update(gate_stats)
+        return stats
+
+    def _step_gate(
+            self,
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=0,
+            training=False,
+            iteration=None,
+            camera_center=None,
+            gate_train_mode="soft_all",
+            gate_eval_mode="topk",
+            gate_temperature_init=1.0,
+            gate_temperature_final=0.2,
+            gate_temperature_max_steps=30000,
+            gate_budget_lambda=0.01,
+            gate_binary_lambda=0.001,
+            gate_feature_mode="detail_view",
+            gate_opacity_mode="st_identity",
+            gate_all_detail_until=0,
+    ):
+        self._gate_used = True
+        visible_count = coords.shape[0]
+        slot_count = min(offset_slots.shape[1], self.max_detail_slots)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        full_detail_budget = visible_count * slot_count
+        budget_overflow = render_gaussian_budget > 0 and visible_count > render_gaussian_budget
+        warmup_all_detail = self._gate_all_detail_warmup_active(
+            training,
+            iteration,
+            gate_all_detail_until,
+        )
+
+        if visible_count == 0 or slot_count == 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                0,
+                0,
+                False,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, self._zero_gate_losses(coords))
+
+        if render_gaussian_budget <= 0 or warmup_all_detail:
+            detail_budget = full_detail_budget
+        else:
+            detail_budget = max(render_gaussian_budget - visible_count, 0)
+            detail_budget = min(detail_budget, full_detail_budget)
+
+        if detail_budget <= 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                0,
+                0,
+                budget_overflow,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, self._zero_gate_losses(coords))
+
+        offset_slots = offset_slots[:, :slot_count]
+        candidate_xyz = coords[:, None, :] + offset_slots
+        candidate_xyz = candidate_xyz.reshape(-1, 3)
+        temporal_h = pose.unsqueeze(0).repeat(visible_count, 1)
+        temporal_detail = temporal_h[:, None, :].expand(-1, slot_count, -1).reshape(-1, temporal_h.shape[-1])
+        scale_detail = scale_input[:, None, :].expand(-1, slot_count, -1).reshape(-1, scale_input.shape[-1])
+        rotate_detail = rotate_input[:, None, :].expand(-1, slot_count, -1).reshape(-1, rotate_input.shape[-1])
+
+        detail_spatial_h = self.encoder.encode_xyz(candidate_xyz.detach())
+        if render_gaussian_budget <= 0 or warmup_all_detail:
+            selected_idx = torch.arange(full_detail_budget, device=coords.device, dtype=torch.long)
+            selected_gate = coords.new_ones(full_detail_budget)
+            gate_losses = self._zero_gate_losses(coords)
+            gate_stats = {
+                "gate_temperature": 0.0,
+                "gate_mass": float(full_detail_budget),
+                "gate_mean": 1.0,
+                "gate_max": 1.0,
+                "gate_min": 1.0,
+                "gate_budget_loss": 0.0,
+                "gate_binary_loss": 0.0,
+            }
+        else:
+            gate_feature = self._gate_input_feature(
+                detail_spatial_h,
+                candidate_xyz,
+                camera_center,
+                gate_feature_mode,
+            )
+            gate_result = self.gate_allocator.select(
+                gate_feature,
+                detail_budget,
+                training=training,
+                train_mode=gate_train_mode,
+                eval_mode=gate_eval_mode,
+                iteration=iteration,
+                temperature_init=gate_temperature_init,
+                temperature_final=gate_temperature_final,
+                temperature_max_steps=gate_temperature_max_steps,
+                budget_lambda=gate_budget_lambda,
+                binary_lambda=gate_binary_lambda,
+            )
+            selected_idx = gate_result["selected_idx"]
+            selected_gate = gate_result["selected_gate"]
+            gate_losses = gate_result["losses"]
+            gate_stats = gate_result["stats"]
+
+        if selected_idx.numel() == 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                detail_budget,
+                0,
+                budget_overflow,
+                gate_stats,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, gate_losses)
+
+        anchor_idx = torch.div(selected_idx, slot_count, rounding_mode="floor")
+        slot_idx = selected_idx - anchor_idx * slot_count
+        detail_counts = torch.bincount(anchor_idx, minlength=visible_count).to(dtype=torch.long)
+        detail_h = self.decoder.compute_hidden(
+            detail_spatial_h[selected_idx],
+            temporal_detail[selected_idx],
+            scale_detail[selected_idx],
+            rotate_detail[selected_idx],
+        )
+        color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h)
+
+        opacity_mode = str(gate_opacity_mode or "st_identity").lower()
+        if opacity_mode in ("multiply", "gate_multiply"):
+            opacity = opacity * selected_gate.unsqueeze(-1)
+        elif opacity_mode in ("st_identity", "straight_through", "identity_st"):
+            if training:
+                gate_multiplier = 1.0 + selected_gate.unsqueeze(-1) - selected_gate.detach().unsqueeze(-1)
+                opacity = opacity * gate_multiplier
+        elif opacity_mode in ("none", "identity"):
+            pass
+        else:
+            raise ValueError(f"Unsupported gate_opacity_mode: {gate_opacity_mode}")
+
+        budget_stats = self._gate_budget_stats(
+            render_gaussian_budget,
+            visible_count,
+            detail_budget,
+            selected_idx.numel(),
+            budget_overflow,
+            gate_stats,
+            allocation_warmup_active=warmup_all_detail,
+        )
+
+        return {
+            "d_color": color,
+            "d_rotation": rotation,
+            "d_scaling": scaling,
+            "d_opacity": opacity,
+            "detail_anchor_idx": anchor_idx,
+            "detail_slot_idx": slot_idx.to(torch.long),
+            "detail_counts": detail_counts,
+            "budget_stats": budget_stats,
+            "gate_losses": gate_losses,
+        }
+
+    def step(
+            self,
+            data,
+            pose,
+            render_gaussian_budget=0,
+            scale_min=0.0,
+            allocation_mode="proposal",
+            training=False,
+            iteration=None,
+            camera_center=None,
+            gate_train_mode="soft_all",
+            gate_eval_mode="topk",
+            gate_temperature_init=1.0,
+            gate_temperature_final=0.2,
+            gate_temperature_max_steps=30000,
+            gate_budget_lambda=0.01,
+            gate_binary_lambda=0.001,
+            gate_feature_mode="detail_view",
+            gate_opacity_mode="st_identity",
+            gate_all_detail_until=0,
+    ):
+        coords = data[0]
+        scale_input = data[1]
+        rotate_input = data[2]
+        if len(data) > 3:
+            offset_slots = data[3]
+        else:
+            offset_slots = coords.new_zeros((coords.shape[0], 1, 3))
+        offset_slots = offset_slots.to(device=coords.device, dtype=coords.dtype)
+
+        mode = str(allocation_mode or "proposal").lower()
+        if mode in ("gate", "learned_gate"):
+            return self._step_gate(
+                coords,
+                scale_input,
+                rotate_input,
+                offset_slots,
+                pose,
+                render_gaussian_budget=render_gaussian_budget,
+                training=training,
+                iteration=iteration,
+                camera_center=camera_center,
+                gate_train_mode=gate_train_mode,
+                gate_eval_mode=gate_eval_mode,
+                gate_temperature_init=gate_temperature_init,
+                gate_temperature_final=gate_temperature_final,
+                gate_temperature_max_steps=gate_temperature_max_steps,
+                gate_budget_lambda=gate_budget_lambda,
+                gate_binary_lambda=gate_binary_lambda,
+                gate_feature_mode=gate_feature_mode,
+                gate_opacity_mode=gate_opacity_mode,
+                gate_all_detail_until=gate_all_detail_until,
+            )
+        if mode not in ("proposal", "decoder", "decoder_proposal", ""):
+            raise ValueError(f"Unsupported allocation_mode: {allocation_mode}")
+        return self._step_proposal(
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=render_gaussian_budget,
+            scale_min=scale_min,
+        )
+
     def train_setting(self, training_args):
         self.decoder_lr_scale = training_args.decoder_lr_scale
         self.encoder_lr_scale = training_args.encoder_lr_scale
@@ -200,7 +498,10 @@ class MixGSModel:
              "name": "decoder"},
             {'params': list(self.encoder.parameters()),
              'lr': training_args.position_lr_init * self.encoder_lr_scale,
-             "name": "encoder"}
+             "name": "encoder"},
+            {'params': list(self.gate_allocator.parameters()),
+             'lr': training_args.position_lr_init * self.decoder_lr_scale,
+             "name": "gate"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -223,7 +524,11 @@ class MixGSModel:
         else:
             out_weights_path = os.path.join(model_path, "decoder/iteration_{}".format(iteration))
             os.makedirs(out_weights_path, exist_ok=True)
-        torch.save((self.encoder.state_dict(), self.decoder.state_dict()), os.path.join(out_weights_path, 'decoder.pth'))
+        if self._gate_used:
+            weights = (self.encoder.state_dict(), self.decoder.state_dict(), self.gate_allocator.state_dict())
+        else:
+            weights = (self.encoder.state_dict(), self.decoder.state_dict())
+        torch.save(weights, os.path.join(out_weights_path, 'decoder.pth'))
 
     def load_weights(self, model_path, iteration=-1):
         if iteration == -1:
@@ -234,17 +539,33 @@ class MixGSModel:
             weights_path = os.path.join(model_path, "decoder/iteration_{}/decoder.pth".format(loaded_iter))
 
         print("Load weight:", weights_path)
-        grid_weight, network_weight = torch.load(weights_path, map_location='cuda')
+        weights = torch.load(weights_path, map_location='cuda')
+        gate_weight = None
+        if isinstance(weights, (tuple, list)) and len(weights) == 3:
+            grid_weight, network_weight, gate_weight = weights
+        elif isinstance(weights, (tuple, list)) and len(weights) == 2:
+            grid_weight, network_weight = weights
+        else:
+            raise RuntimeError(f"Unsupported decoder checkpoint format: {weights_path}")
         try:
             self.decoder.load_state_dict(network_weight)
         except RuntimeError as exc:
             print("Decoder state dict loaded with strict=False:", exc)
             self.decoder.load_state_dict(network_weight, strict=False)
+        if gate_weight is not None:
+            try:
+                self.gate_allocator.load_state_dict(gate_weight)
+                self._gate_used = True
+            except RuntimeError as exc:
+                print("Gate allocator state dict skipped due to incompatible shape:", exc)
         self.encoder.load_state_dict(grid_weight)
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "decoder":
+                lr = self.decoder_lr_scheduler(iteration)
+                param_group['lr'] = lr
+            elif param_group["name"] == "gate":
                 lr = self.decoder_lr_scheduler(iteration)
                 param_group['lr'] = lr
             elif param_group['name'] == "encoder":

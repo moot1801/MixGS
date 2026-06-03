@@ -182,6 +182,14 @@ class TrainingResourceLogger:
         "stage_budget_scale",
         "stage_budget_reference_vram_mb",
         "stage_budget_observed_vram_mb",
+        "allocation_mode_id",
+        "gate_temperature",
+        "gate_mass",
+        "gate_mean",
+        "gate_max",
+        "gate_min",
+        "gate_budget_loss",
+        "gate_binary_loss",
     ]
     VRAM_FIELDS = [
         "vram_allocated_mb",

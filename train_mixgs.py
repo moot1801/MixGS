@@ -185,17 +185,50 @@ def _visible_hash_input(gaussians, vis_mask):
     ]
 
 
-def _render_with_proposal_budget(
-        viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget):
+def _gate_step_kwargs(pipe, iteration=None, training=False):
+    return {
+        "allocation_mode": getattr(pipe, "allocation_mode", "proposal"),
+        "training": training,
+        "iteration": iteration,
+        "gate_train_mode": getattr(pipe, "gate_train_mode", "soft_all"),
+        "gate_eval_mode": getattr(pipe, "gate_eval_mode", "topk"),
+        "gate_temperature_init": getattr(pipe, "gate_temperature_init", 1.0),
+        "gate_temperature_final": getattr(pipe, "gate_temperature_final", 0.2),
+        "gate_temperature_max_steps": getattr(pipe, "gate_temperature_max_steps", 30000),
+        "gate_budget_lambda": getattr(pipe, "gate_budget_lambda", 0.01),
+        "gate_binary_lambda": getattr(pipe, "gate_binary_lambda", 0.001),
+    }
+
+
+def _render_with_allocation_budget(
+        viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget,
+        iteration=None, training=False):
     hash_input = _visible_hash_input(gaussians, vis_mask)
     decoded_data = mixgs.step(
         hash_input,
         _camera_pose(viewpoint),
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
+        **_gate_step_kwargs(pipe, iteration=iteration, training=training),
     )
     render_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, decoded_data)
     return render_pkg, decoded_data
+
+
+def _render_with_proposal_budget(
+        viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget,
+        iteration=None, training=False):
+    return _render_with_allocation_budget(
+        viewpoint,
+        gaussians,
+        mixgs,
+        pipe,
+        background,
+        vis_mask,
+        render_gaussian_budget,
+        iteration=iteration,
+        training=training,
+    )
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
@@ -303,7 +336,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             if budget_decay_schedule.enabled:
                 stage_budget_scale = budget_decay_schedule.current_scale(iteration)
             gt_image = gt_image.cuda()
-            render_pkg, decoded_data = _render_with_proposal_budget(
+            render_pkg, decoded_data = _render_with_allocation_budget(
                 cam_info,
                 gaussians,
                 mixgs,
@@ -311,6 +344,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 background,
                 vis_mask,
                 effective_render_gaussian_budget,
+                iteration=iteration,
+                training=True,
             )
 
             image, radii = render_pkg["render"], render_pkg["radii"]
@@ -321,6 +356,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             start = time.time()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+            gate_losses = decoded_data.get("gate_losses")
+            if gate_losses:
+                loss = loss + gate_losses.get("loss", image.new_zeros(()))
 
             loss.backward()
             end = time.time()
@@ -369,6 +407,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "stage_budget_scale": budget_stats.get("stage_budget_scale", 1.0),
                     "stage_budget_reference_vram_mb": budget_stats.get("stage_budget_reference_vram_mb", 0),
                     "stage_budget_observed_vram_mb": budget_stats.get("stage_budget_observed_vram_mb", 0),
+                    "allocation_mode_id": budget_stats.get("allocation_mode_id", 0.0),
+                    "gate_mass": budget_stats.get("gate_mass", 0.0),
+                    "gate_mean": budget_stats.get("gate_mean", 0.0),
+                    "gate_budget_loss": budget_stats.get("gate_budget_loss", 0.0),
+                    "gate_binary_loss": budget_stats.get("gate_binary_loss", 0.0),
                 }
 
                 lr = {}

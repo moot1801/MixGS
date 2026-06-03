@@ -73,13 +73,21 @@ class GSDecoder(nn.Module):
         self.gaussian_scaling = nn.Linear(width, 3)
         self.gaussian_opacity = nn.Linear(width, 1)
 
-    def compute_hidden(self, spatial_h, pose_input, scale_input, rotate_input):
+    def compute_routing_feature(self, spatial_h, pose_input, scale_input, rotate_input):
         spatial_h = self.spatial_mlp(spatial_h)
         cat_feat = torch.cat([pose_input, scale_input, rotate_input], dim=1)
 
         cat_feat = self.mlp(cat_feat)
         h = spatial_h * (2 * torch.sigmoid(cat_feat) - 1)
+        return h
+
+    def refine_hidden(self, h):
         h = self.tiny_mlp(h)
+        return h
+
+    def compute_hidden(self, spatial_h, pose_input, scale_input, rotate_input):
+        h = self.compute_routing_feature(spatial_h, pose_input, scale_input, rotate_input)
+        h = self.refine_hidden(h)
         return h
 
     def proposal_score(self, h, scale_min=0.0, scale_power=1.0):

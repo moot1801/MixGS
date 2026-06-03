@@ -1,0 +1,76 @@
+# Model Parameters
+model_params: {
+    model_config: {
+        name: "GaussianModel",
+        kwargs: {}
+    },
+    sh_degree: 3,
+    source_path: "data/mill19/rubble-pixsfm/train",
+    pretrain_path: "data/coarse_gaussians/rubble_point_cloud.ply",
+    model_path: "output/rubble_gate_allocation",
+    images: "images",
+    resolution: 4,
+    white_background: False,
+    data_device: "cuda",
+    eval: True,
+    llffhold: None, # 83,
+    # MixGS 기본 렌더링 자원과 맞추기 위해 실제 선택 detail 수는 visible_anchor와 같게 유지한다.
+    # gate allocation이 선택할 후보는 최소 2개 slot만 둔다.
+    detail_max_slots: 2,
+    detail_count_choices: [0, 1, 2],
+    hash_args: {
+        canonical_num_levels: 32,
+        canonical_level_dim: 2,
+        canonical_base_resolution: 32,
+        canonical_desired_resolution: 2048,
+        canonical_log2_hashmap_size: 22,
+        bound: 202.19
+    },
+    network_args: {
+      depth: 1,
+      width: 32,
+    }
+}
+
+# Pipeline Parameters
+pipeline_params: {
+    convert_SHs_python:  False,
+    compute_cov3D_python:  False,
+    debug:  False,
+    scale_min: 0.0005,
+    metric_log_interval: 10_000,
+    allocation_mode: "gate",
+    # resolve_render_gaussian_budget(-1) = visible_anchor_count * 2 이므로
+    # detail_budget = render_gaussian_budget - visible_anchor_count = visible_anchor_count 가 된다.
+    render_gaussian_budget: -1,
+    gate_train_mode: "topk",
+    gate_eval_mode: "topk",
+    gate_temperature_init: 1.0,
+    gate_temperature_final: 0.2,
+    gate_temperature_max_steps: 250_000,
+    gate_budget_lambda: 0.01,
+    gate_binary_lambda: 0.001,
+    resource_log_interval: 100,
+    resource_plot_on_complete: True,
+}
+
+
+# Optimization Parameters
+optim_params: {
+    iterations: 250_000,
+    joint_start_iter: 50_000,
+    position_lr_init: 0.0000064,
+    position_lr_final: 0.000000064,
+    position_lr_delay_mult: 0.01,
+    position_lr_max_steps: 250_000,
+    decoder_lr_max_steps: 250_000,
+    feature_lr: 0.00025,
+    opacity_lr: 0.005,
+    scaling_lr: 0.0005,
+    rotation_lr: 0.0001,
+    # removed: percent_dense: 0.01,
+    lambda_dssim: 0.2,
+    opacity_thr: 0.5,
+    encoder_lr_scale: 600.0,
+    decoder_lr_scale: 80.0,
+}

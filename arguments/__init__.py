@@ -71,6 +71,14 @@ class PipelineParams(ParamGroup):
         self.scale_min = 0.0
         self.render_gaussian_budget = 0
         self.render_gaussian_budget_multiplier = 0.0
+        self.allocation_mode = "proposal"
+        self.gate_train_mode = "soft_all"
+        self.gate_eval_mode = "topk"
+        self.gate_temperature_init = 1.0
+        self.gate_temperature_final = 0.2
+        self.gate_temperature_max_steps = 30_000
+        self.gate_budget_lambda = 0.01
+        self.gate_binary_lambda = 0.001
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10

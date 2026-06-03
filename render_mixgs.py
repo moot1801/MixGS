@@ -68,6 +68,15 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             cam_info['world_view_transform'][0][-1, :-1],
             render_gaussian_budget=render_gaussian_budget,
             scale_min=getattr(pipeline, "scale_min", 0.0),
+            allocation_mode=getattr(pipeline, "allocation_mode", "proposal"),
+            training=False,
+            gate_train_mode=getattr(pipeline, "gate_train_mode", "soft_all"),
+            gate_eval_mode=getattr(pipeline, "gate_eval_mode", "topk"),
+            gate_temperature_init=getattr(pipeline, "gate_temperature_init", 1.0),
+            gate_temperature_final=getattr(pipeline, "gate_temperature_final", 0.2),
+            gate_temperature_max_steps=getattr(pipeline, "gate_temperature_max_steps", 30000),
+            gate_budget_lambda=getattr(pipeline, "gate_budget_lambda", 0.01),
+            gate_binary_lambda=getattr(pipeline, "gate_binary_lambda", 0.001),
         )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 
