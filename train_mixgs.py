@@ -176,12 +176,21 @@ def _camera_pose(viewpoint):
     return transform[-1, :-1]
 
 
+def _camera_center(viewpoint):
+    center = viewpoint.get("camera_center")
+    if isinstance(center, torch.Tensor):
+        while center.dim() > 1:
+            center = center[0]
+    return center
+
+
 def _visible_hash_input(gaussians, vis_mask):
     return [
         gaussians.get_xyz[vis_mask].detach(),
         gaussians.get_scaling[vis_mask].detach(),
         gaussians.get_rotation[vis_mask].detach(),
         gaussians.get_offset_slots[vis_mask].detach(),
+        torch.nonzero(vis_mask, as_tuple=False).flatten().detach(),
     ]
 
 
@@ -197,6 +206,9 @@ def _gate_step_kwargs(pipe, iteration=None, training=False):
         "gate_temperature_max_steps": getattr(pipe, "gate_temperature_max_steps", 30000),
         "gate_budget_lambda": getattr(pipe, "gate_budget_lambda", 0.01),
         "gate_binary_lambda": getattr(pipe, "gate_binary_lambda", 0.001),
+        "gate_feature_mode": getattr(pipe, "gate_feature_mode", "detail_view"),
+        "gate_opacity_mode": getattr(pipe, "gate_opacity_mode", "st_identity"),
+        "gate_all_detail_until": getattr(pipe, "gate_all_detail_until", 0),
     }
 
 
@@ -207,6 +219,7 @@ def _render_with_allocation_budget(
     decoded_data = mixgs.step(
         hash_input,
         _camera_pose(viewpoint),
+        camera_center=_camera_center(viewpoint),
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
         **_gate_step_kwargs(pipe, iteration=iteration, training=training),
@@ -229,6 +242,185 @@ def _render_with_proposal_budget(
         iteration=iteration,
         training=training,
     )
+
+
+def _gate_utility_default_stats(device=None):
+    zero = torch.zeros((), device=device or "cuda") if torch.cuda.is_available() else torch.zeros(())
+    return zero, {
+        "gate_utility_loss": 0.0,
+        "gate_utility_samples": 0,
+        "gate_utility_mean": 0.0,
+        "gate_utility_positive_ratio": 0.0,
+        "gate_utility_eval_time_ms": 0.0,
+        "gate_utility_view_bins": 0,
+    }
+
+
+def _decoded_data_with_detail_mask(decoded_data, keep_mask):
+    masked = dict(decoded_data)
+    for field in ("d_color", "d_rotation", "d_scaling", "d_opacity", "detail_anchor_idx", "detail_slot_idx"):
+        masked[field] = decoded_data[field][keep_mask]
+    detail_counts = decoded_data.get("detail_counts")
+    if detail_counts is not None:
+        anchor_count = int(detail_counts.shape[0])
+        if masked["detail_anchor_idx"].numel() > 0:
+            masked["detail_counts"] = torch.bincount(
+                masked["detail_anchor_idx"],
+                minlength=anchor_count,
+            ).to(dtype=torch.long)
+        else:
+            masked["detail_counts"] = torch.zeros(anchor_count, device=keep_mask.device, dtype=torch.long)
+    return masked
+
+
+def _mse_metric(image, gt_image):
+    return torch.mean((image - gt_image) ** 2)
+
+
+def _gate_utility_ranking_loss(scores, targets, min_delta=0.0):
+    if scores.numel() < 2:
+        return scores.new_zeros(())
+    target_diff = targets.unsqueeze(1) - targets.unsqueeze(0)
+    valid = torch.abs(target_diff) > float(min_delta or 0.0)
+    if not torch.any(valid):
+        return scores.new_zeros(())
+    score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    target_sign = torch.sign(target_diff[valid])
+    return torch.nn.functional.softplus(-target_sign * score_diff[valid]).mean()
+
+
+def _gate_utility_key(anchor_id, slot_id, view_bin=0):
+    return int(anchor_id), int(slot_id), int(view_bin)
+
+
+def _gate_utility_view_bins(viewpoint, gaussians, vis_mask, decoded_data, bin_count):
+    anchor_idx = decoded_data.get("detail_anchor_idx")
+    if anchor_idx is None:
+        return None
+    bin_count = max(1, int(bin_count or 1))
+    if bin_count <= 1 or anchor_idx.numel() == 0:
+        return torch.zeros(anchor_idx.shape[0], device=anchor_idx.device, dtype=torch.long)
+    camera_center = _camera_center(viewpoint)
+    if camera_center is None:
+        return torch.zeros(anchor_idx.shape[0], device=anchor_idx.device, dtype=torch.long)
+    visible_xyz = gaussians.get_xyz[vis_mask].detach()
+    if not isinstance(camera_center, torch.Tensor):
+        camera_center = visible_xyz.new_tensor(camera_center)
+    camera_center = camera_center.to(device=visible_xyz.device, dtype=visible_xyz.dtype)
+    while camera_center.dim() > 1:
+        camera_center = camera_center[0]
+    selected_xyz = visible_xyz[anchor_idx.to(device=visible_xyz.device, dtype=torch.long)]
+    delta = camera_center.unsqueeze(0) - selected_xyz
+    angle = torch.atan2(delta[:, 1], delta[:, 0]) + 3.141592653589793
+    view_bins = torch.floor(angle / (2.0 * 3.141592653589793) * float(bin_count)).to(torch.long)
+    return view_bins.clamp_(0, bin_count - 1).to(device=anchor_idx.device)
+
+
+def _compute_gate_utility_loss(
+        viewpoint,
+        gaussians,
+        pipe,
+        background,
+        vis_mask,
+        decoded_data,
+        image,
+        gt_image,
+        utility_ema,
+        iteration,
+):
+    selected_logits = decoded_data.get("gate_selected_logits")
+    device = image.device
+    zero_loss, stats = _gate_utility_default_stats(device)
+    if not bool(getattr(pipe, "gate_utility_loss", False)):
+        return zero_loss, stats
+    if str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower() not in ("gate", "learned_gate"):
+        return zero_loss, stats
+    if selected_logits is None or selected_logits.numel() < 2:
+        return zero_loss, stats
+
+    anchor_ids = decoded_data.get("gate_selected_anchor_idx")
+    slot_ids = decoded_data.get("gate_selected_slot_idx")
+    if anchor_ids is None or slot_ids is None:
+        return zero_loss, stats
+
+    view_bin_count = max(1, int(getattr(pipe, "gate_utility_ema_view_bins", 1) or 1))
+    view_bins = _gate_utility_view_bins(viewpoint, gaussians, vis_mask, decoded_data, view_bin_count)
+
+    selected_count = int(selected_logits.numel())
+    sample_count = min(max(0, int(getattr(pipe, "gate_utility_sample_count", 64) or 0)), selected_count)
+    if sample_count < 2:
+        return zero_loss, stats
+
+    sample_pos = torch.randperm(selected_count, device=device)[:sample_count]
+    interval = max(0, int(getattr(pipe, "gate_utility_interval", 100) or 0))
+    group_size = max(1, int(getattr(pipe, "gate_utility_group_size", 8) or 1))
+    ema_decay = max(0.0, min(float(getattr(pipe, "gate_utility_ema_decay", 0.95) or 0.95), 0.9999))
+    eval_time_ms = 0.0
+
+    if interval > 0 and int(iteration) % interval == 0:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        utility_start = time.time()
+        with torch.no_grad():
+            mse_with = _mse_metric(image.detach(), gt_image.detach())
+            for group_pos in torch.split(sample_pos, group_size):
+                keep_mask = torch.ones(selected_count, device=device, dtype=torch.bool)
+                keep_mask[group_pos] = False
+                masked_decoded = _decoded_data_with_detail_mask(decoded_data, keep_mask)
+                counterfactual_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, masked_decoded)
+                mse_without = _mse_metric(counterfactual_pkg["render"].detach(), gt_image.detach())
+                utility_value = float(((mse_without - mse_with) / max(1, int(group_pos.numel()))).item())
+                for pos in group_pos.detach().cpu().tolist():
+                    view_bin = 0 if view_bins is None else view_bins[pos].detach().cpu().item()
+                    key = _gate_utility_key(
+                        anchor_ids[pos].detach().cpu().item(),
+                        slot_ids[pos].detach().cpu().item(),
+                        view_bin,
+                    )
+                    previous = utility_ema.get(key)
+                    utility_ema[key] = utility_value if previous is None else ema_decay * previous + (1.0 - ema_decay) * utility_value
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        eval_time_ms = (time.time() - utility_start) * 1000.0
+
+    known_positions = []
+    known_targets = []
+    for pos in sample_pos.detach().cpu().tolist():
+        view_bin = 0 if view_bins is None else view_bins[pos].detach().cpu().item()
+        key = _gate_utility_key(
+            anchor_ids[pos].detach().cpu().item(),
+            slot_ids[pos].detach().cpu().item(),
+            view_bin,
+        )
+        if key in utility_ema:
+            known_positions.append(pos)
+            known_targets.append(utility_ema[key])
+
+    if len(known_positions) < 2:
+        stats["gate_utility_eval_time_ms"] = eval_time_ms
+        stats["gate_utility_view_bins"] = int(view_bin_count)
+        return zero_loss, stats
+
+    known_pos_tensor = torch.tensor(known_positions, device=device, dtype=torch.long)
+    targets = torch.tensor(known_targets, device=device, dtype=selected_logits.dtype)
+    scores = selected_logits[known_pos_tensor]
+    utility_loss = _gate_utility_ranking_loss(
+        scores,
+        targets,
+        min_delta=float(getattr(pipe, "gate_utility_min_delta", 0.0) or 0.0),
+    )
+    utility_loss = utility_loss * float(getattr(pipe, "gate_utility_lambda", 0.01) or 0.0)
+
+    with torch.no_grad():
+        stats.update({
+            "gate_utility_loss": float(utility_loss.detach().item()),
+            "gate_utility_samples": int(len(known_positions)),
+            "gate_utility_mean": float(targets.detach().mean().item()),
+            "gate_utility_positive_ratio": float((targets.detach() > 0).to(torch.float32).mean().item()),
+            "gate_utility_eval_time_ms": float(eval_time_ms),
+            "gate_utility_view_bins": int(view_bin_count),
+        })
+    return utility_loss, stats
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
@@ -265,6 +457,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
         net_args=dataset.network_args,
         max_detail_slots=getattr(dataset, "detail_max_slots", 1),
         detail_count_choices=detail_count_choices,
+        gate_feature_mode=getattr(pipe, "gate_feature_mode", "detail_view"),
+        gate_view_context_dim=getattr(pipe, "gate_view_context_dim", 32),
     )
     budget_decay_schedule = StageBudgetDecaySchedule(
         pipe,
@@ -294,6 +488,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     ema_loss_for_log = 0.0
     ema_time_render = 0.0
     ema_time_loss = 0.0
+    gate_utility_ema = {}
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     iteration = first_iter
@@ -359,6 +554,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             gate_losses = decoded_data.get("gate_losses")
             if gate_losses:
                 loss = loss + gate_losses.get("loss", image.new_zeros(()))
+            gate_utility_loss, gate_utility_stats = _compute_gate_utility_loss(
+                cam_info,
+                gaussians,
+                pipe,
+                background,
+                vis_mask,
+                decoded_data,
+                image,
+                gt_image,
+                gate_utility_ema,
+                iteration,
+            )
+            loss = loss + gate_utility_loss
 
             loss.backward()
             end = time.time()
@@ -376,6 +584,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     progress_bar.close()
 
                 budget_stats = render_pkg.get("budget_stats", {})
+                budget_stats.update(gate_utility_stats)
                 observed_vram_mb = 0.0
                 if torch.cuda.is_available():
                     observed_vram_mb = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
@@ -408,10 +617,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "stage_budget_reference_vram_mb": budget_stats.get("stage_budget_reference_vram_mb", 0),
                     "stage_budget_observed_vram_mb": budget_stats.get("stage_budget_observed_vram_mb", 0),
                     "allocation_mode_id": budget_stats.get("allocation_mode_id", 0.0),
+                    "allocation_warmup_active": budget_stats.get("allocation_warmup_active", 0.0),
                     "gate_mass": budget_stats.get("gate_mass", 0.0),
                     "gate_mean": budget_stats.get("gate_mean", 0.0),
                     "gate_budget_loss": budget_stats.get("gate_budget_loss", 0.0),
                     "gate_binary_loss": budget_stats.get("gate_binary_loss", 0.0),
+                    "gate_utility_loss": budget_stats.get("gate_utility_loss", 0.0),
+                    "gate_utility_samples": budget_stats.get("gate_utility_samples", 0),
+                    "gate_utility_mean": budget_stats.get("gate_utility_mean", 0.0),
+                    "gate_utility_positive_ratio": budget_stats.get("gate_utility_positive_ratio", 0.0),
+                    "gate_utility_eval_time_ms": budget_stats.get("gate_utility_eval_time_ms", 0.0),
                 }
 
                 lr = {}
@@ -526,6 +741,21 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
         ):
             if key in ema_time:
                 metrics_to_log["train_budget/" + key] = ema_time[key]
+        for key in (
+            "allocation_mode_id",
+            "allocation_warmup_active",
+            "gate_mass",
+            "gate_mean",
+            "gate_budget_loss",
+            "gate_binary_loss",
+            "gate_utility_loss",
+            "gate_utility_samples",
+            "gate_utility_mean",
+            "gate_utility_positive_ratio",
+            "gate_utility_eval_time_ms",
+        ):
+            if key in ema_time:
+                metrics_to_log["train_gate/" + key] = ema_time[key]
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)

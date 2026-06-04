@@ -8,6 +8,33 @@ from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func, resolve_detail_count_choices
 
 
+class ViewContextEncoder(nn.Module):
+    def __init__(self, spatial_dim, context_dim=32, hidden_dim=64):
+        super().__init__()
+        context_dim = max(2, int(context_dim or 32))
+        pooled_dim = max(1, context_dim // 2)
+        self.context_dim = pooled_dim * 2
+        self.anchor_mlp = nn.Sequential(
+            nn.Linear(spatial_dim + 5, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, pooled_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, anchor_hash, view_dir, distance, scale_mean):
+        if anchor_hash.numel() == 0:
+            return anchor_hash.new_zeros((self.context_dim,))
+        anchor_feature = torch.cat([anchor_hash, view_dir, distance, scale_mean], dim=-1)
+        pooled_feature = self.anchor_mlp(anchor_feature)
+        return torch.cat(
+            [
+                pooled_feature.mean(dim=0),
+                pooled_feature.max(dim=0).values,
+            ],
+            dim=-1,
+        )
+
+
 class MixGSModel:
     def __init__(
             self,
@@ -15,6 +42,8 @@ class MixGSModel:
             net_args,
             max_detail_slots=1,
             detail_count_choices=None,
+            gate_feature_mode="detail_view",
+            gate_view_context_dim=32,
     ):
         self.encoder = GSEncoder(**hash_args).cuda()
         self.spatial_dim = self.encoder.canonical_level_dim * self.encoder.canonical_num_levels
@@ -25,7 +54,14 @@ class MixGSModel:
         net_args = dict(net_args)
         net_args["max_detail_slots"] = self.max_detail_slots
         self.decoder = GSDecoder(spatial_in_dim=self.spatial_dim, mlp_in_dim=self.mlp_dim, **net_args).cuda()
-        self.gate_feature_dim = self.spatial_dim + 3
+        self.gate_feature_mode = str(gate_feature_mode or "detail_view").lower()
+        self.gate_uses_view_context = self.gate_feature_mode in ("hash_view_context", "view_context")
+        self.view_context_encoder = (
+            ViewContextEncoder(self.spatial_dim, gate_view_context_dim).cuda()
+            if self.gate_uses_view_context else None
+        )
+        self.gate_extra_dim = self.view_context_encoder.context_dim if self.gate_uses_view_context else 8
+        self.gate_feature_dim = self.spatial_dim + self.gate_extra_dim
         self.gate_allocator = GateAllocator(self.gate_feature_dim).cuda()
         self._gate_used = False
 
@@ -160,6 +196,35 @@ class MixGSModel:
         zero = coords.new_zeros(())
         return {"loss": zero, "budget": zero, "binary": zero}
 
+    def _match_gate_extra_dim(self, extra):
+        if extra.shape[-1] == self.gate_extra_dim:
+            return extra
+        if extra.shape[-1] > self.gate_extra_dim:
+            return extra[:, :self.gate_extra_dim]
+        pad = extra.new_zeros((extra.shape[0], self.gate_extra_dim - extra.shape[-1]))
+        return torch.cat([extra, pad], dim=-1)
+
+    def _view_context_feature(self, coords, scale_input, camera_center):
+        with torch.no_grad():
+            anchor_hash = self.encoder.encode_xyz(coords.detach()).detach()
+        feature_count = anchor_hash.shape[0]
+        if camera_center is not None:
+            if not isinstance(camera_center, torch.Tensor):
+                camera_center = coords.new_tensor(camera_center)
+            camera_center = camera_center.to(device=coords.device, dtype=coords.dtype)
+            while camera_center.dim() > 1:
+                camera_center = camera_center[0]
+            delta = camera_center.unsqueeze(0) - coords.detach()
+            view_dir = F.normalize(delta, dim=-1, eps=1e-6).detach()
+            distance = torch.log1p(delta.norm(dim=-1, keepdim=True)).detach()
+            distance_scale = distance.detach().max().clamp_min(1.0)
+            distance = distance / distance_scale
+        else:
+            view_dir = anchor_hash.new_zeros((feature_count, 3))
+            distance = anchor_hash.new_zeros((feature_count, 1))
+        scale_mean = scale_input.detach().to(device=coords.device, dtype=coords.dtype).mean(dim=-1, keepdim=True)
+        return self.view_context_encoder(anchor_hash, view_dir, distance, scale_mean)
+
     @staticmethod
     def _gate_all_detail_warmup_active(training, iteration, all_detail_until):
         if not training:
@@ -169,25 +234,84 @@ class MixGSModel:
             return False
         return int(iteration) <= all_detail_until
 
-    def _gate_input_feature(self, detail_spatial_h, candidate_xyz, camera_center, gate_feature_mode):
+    def _gate_input_feature(
+            self,
+            detail_spatial_h,
+            candidate_xyz,
+            camera_center,
+            gate_feature_mode,
+            candidate_offset=None,
+            candidate_slot_idx=None,
+            slot_count=None,
+            view_context=None,
+    ):
         mode = str(gate_feature_mode or "detail_view").lower()
         spatial_feature = detail_spatial_h.detach()
-        if mode in ("detail_only", "detail"):
-            view_dir = spatial_feature.new_zeros((spatial_feature.shape[0], 3))
-        elif mode in ("detail_view", "detail+view"):
-            if camera_center is None:
-                view_dir = spatial_feature.new_zeros((spatial_feature.shape[0], 3))
+        feature_count = spatial_feature.shape[0]
+        if mode in ("hash_view_context", "view_context"):
+            if view_context is None:
+                extra_feature = spatial_feature.new_zeros((feature_count, self.gate_extra_dim))
             else:
-                if not isinstance(camera_center, torch.Tensor):
-                    camera_center = spatial_feature.new_tensor(camera_center)
-                camera_center = camera_center.to(device=spatial_feature.device, dtype=spatial_feature.dtype)
-                while camera_center.dim() > 1:
-                    camera_center = camera_center[0]
-                view_dir = F.normalize(camera_center.unsqueeze(0) - candidate_xyz.detach(), dim=-1, eps=1e-6)
-                view_dir = view_dir.detach()
-        else:
+                view_context = view_context.to(device=spatial_feature.device, dtype=spatial_feature.dtype)
+                if view_context.dim() == 1:
+                    extra_feature = view_context.unsqueeze(0).expand(feature_count, -1)
+                else:
+                    extra_feature = view_context.expand(feature_count, -1)
+            extra_feature = self._match_gate_extra_dim(extra_feature)
+            return torch.cat([spatial_feature, extra_feature], dim=-1)
+
+        use_view = mode in (
+            "detail_view",
+            "detail+view",
+            "utility",
+            "utility_detail",
+            "detail_view_offset",
+        )
+        use_offset = mode in (
+            "utility",
+            "utility_detail",
+            "detail_offset",
+            "detail_view_offset",
+        )
+        if mode not in (
+                "detail_only",
+                "detail",
+                "detail_view",
+                "detail+view",
+                "utility",
+                "utility_detail",
+                "detail_offset",
+                "detail_view_offset",
+        ):
             raise ValueError(f"Unsupported gate_feature_mode: {gate_feature_mode}")
-        return torch.cat([spatial_feature, view_dir], dim=-1)
+
+        if use_view and camera_center is not None:
+            if not isinstance(camera_center, torch.Tensor):
+                camera_center = spatial_feature.new_tensor(camera_center)
+            camera_center = camera_center.to(device=spatial_feature.device, dtype=spatial_feature.dtype)
+            while camera_center.dim() > 1:
+                camera_center = camera_center[0]
+            view_dir = F.normalize(camera_center.unsqueeze(0) - candidate_xyz.detach(), dim=-1, eps=1e-6).detach()
+        else:
+            view_dir = spatial_feature.new_zeros((feature_count, 3))
+
+        if use_offset and candidate_offset is not None:
+            offset_feature = candidate_offset.to(device=spatial_feature.device, dtype=spatial_feature.dtype).detach()
+            offset_norm = offset_feature.norm(dim=-1, keepdim=True)
+        else:
+            offset_feature = spatial_feature.new_zeros((feature_count, 3))
+            offset_norm = spatial_feature.new_zeros((feature_count, 1))
+
+        if use_offset and candidate_slot_idx is not None:
+            slot_feature = candidate_slot_idx.to(device=spatial_feature.device, dtype=spatial_feature.dtype).view(-1, 1)
+            slot_denominator = max(1, int(slot_count or 1) - 1)
+            slot_feature = (slot_feature / float(slot_denominator)).detach()
+        else:
+            slot_feature = spatial_feature.new_zeros((feature_count, 1))
+
+        extra_feature = torch.cat([view_dir, offset_feature, offset_norm, slot_feature], dim=-1)
+        extra_feature = self._match_gate_extra_dim(extra_feature)
+        return torch.cat([spatial_feature, extra_feature], dim=-1)
 
     def _step_proposal(self, coords, scale_input, rotate_input, offset_slots, pose, render_gaussian_budget=0, scale_min=0.0):
         temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
@@ -275,6 +399,7 @@ class MixGSModel:
             gate_feature_mode="detail_view",
             gate_opacity_mode="st_identity",
             gate_all_detail_until=0,
+            anchor_indices=None,
     ):
         self._gate_used = True
         visible_count = coords.shape[0]
@@ -319,6 +444,9 @@ class MixGSModel:
             return self._empty_decoded_data(coords, detail_counts, budget_stats, self._zero_gate_losses(coords))
 
         offset_slots = offset_slots[:, :slot_count]
+        candidate_offset = offset_slots.reshape(-1, 3)
+        candidate_slot_idx = torch.arange(slot_count, device=coords.device, dtype=torch.long)
+        candidate_slot_idx = candidate_slot_idx.unsqueeze(0).expand(visible_count, -1).reshape(-1)
         candidate_xyz = coords[:, None, :] + offset_slots
         candidate_xyz = candidate_xyz.reshape(-1, 3)
         temporal_h = pose.unsqueeze(0).repeat(visible_count, 1)
@@ -330,6 +458,7 @@ class MixGSModel:
         if render_gaussian_budget <= 0 or warmup_all_detail:
             selected_idx = torch.arange(full_detail_budget, device=coords.device, dtype=torch.long)
             selected_gate = coords.new_ones(full_detail_budget)
+            selected_logits = None
             gate_losses = self._zero_gate_losses(coords)
             gate_stats = {
                 "gate_temperature": 0.0,
@@ -341,11 +470,24 @@ class MixGSModel:
                 "gate_binary_loss": 0.0,
             }
         else:
+            mode = str(gate_feature_mode or self.gate_feature_mode or "detail_view").lower()
+            view_context = None
+            if mode in ("hash_view_context", "view_context"):
+                if not self.gate_uses_view_context or self.view_context_encoder is None:
+                    raise ValueError(
+                        "MixGSModel must be constructed with gate_feature_mode='hash_view_context' "
+                        "to use view context gate features."
+                    )
+                view_context = self._view_context_feature(coords, scale_input, camera_center)
             gate_feature = self._gate_input_feature(
                 detail_spatial_h,
                 candidate_xyz,
                 camera_center,
-                gate_feature_mode,
+                mode,
+                candidate_offset=candidate_offset,
+                candidate_slot_idx=candidate_slot_idx,
+                slot_count=slot_count,
+                view_context=view_context,
             )
             gate_result = self.gate_allocator.select(
                 gate_feature,
@@ -362,6 +504,7 @@ class MixGSModel:
             )
             selected_idx = gate_result["selected_idx"]
             selected_gate = gate_result["selected_gate"]
+            selected_logits = gate_result["logits"][selected_idx] if selected_idx.numel() > 0 else gate_result["logits"].new_empty(0)
             gate_losses = gate_result["losses"]
             gate_stats = gate_result["stats"]
 
@@ -380,6 +523,10 @@ class MixGSModel:
 
         anchor_idx = torch.div(selected_idx, slot_count, rounding_mode="floor")
         slot_idx = selected_idx - anchor_idx * slot_count
+        if anchor_indices is not None:
+            selected_anchor_idx = anchor_indices.to(device=coords.device, dtype=torch.long)[anchor_idx]
+        else:
+            selected_anchor_idx = anchor_idx
         detail_counts = torch.bincount(anchor_idx, minlength=visible_count).to(dtype=torch.long)
         detail_h = self.decoder.compute_hidden(
             detail_spatial_h[selected_idx],
@@ -421,6 +568,11 @@ class MixGSModel:
             "detail_counts": detail_counts,
             "budget_stats": budget_stats,
             "gate_losses": gate_losses,
+            "gate_selected_idx": selected_idx.to(torch.long),
+            "gate_selected_logits": selected_logits if selected_logits is not None else color.new_empty(0),
+            "gate_selected_anchor_idx": selected_anchor_idx.to(torch.long),
+            "gate_selected_slot_idx": slot_idx.to(torch.long),
+            "gate_slot_count": int(slot_count),
         }
 
     def step(
@@ -451,7 +603,10 @@ class MixGSModel:
             offset_slots = data[3]
         else:
             offset_slots = coords.new_zeros((coords.shape[0], 1, 3))
+        anchor_indices = data[4] if len(data) > 4 else None
         offset_slots = offset_slots.to(device=coords.device, dtype=coords.dtype)
+        if anchor_indices is not None:
+            anchor_indices = anchor_indices.to(device=coords.device, dtype=torch.long)
 
         mode = str(allocation_mode or "proposal").lower()
         if mode in ("gate", "learned_gate"):
@@ -475,6 +630,7 @@ class MixGSModel:
                 gate_feature_mode=gate_feature_mode,
                 gate_opacity_mode=gate_opacity_mode,
                 gate_all_detail_until=gate_all_detail_until,
+                anchor_indices=anchor_indices,
             )
         if mode not in ("proposal", "decoder", "decoder_proposal", ""):
             raise ValueError(f"Unsupported allocation_mode: {allocation_mode}")
@@ -499,7 +655,10 @@ class MixGSModel:
             {'params': list(self.encoder.parameters()),
              'lr': training_args.position_lr_init * self.encoder_lr_scale,
              "name": "encoder"},
-            {'params': list(self.gate_allocator.parameters()),
+            {'params': list(self.gate_allocator.parameters()) + (
+                list(self.view_context_encoder.parameters())
+                if self.gate_uses_view_context and self.view_context_encoder is not None else []
+            ),
              'lr': training_args.position_lr_init * self.decoder_lr_scale,
              "name": "gate"}
         ]
@@ -524,7 +683,14 @@ class MixGSModel:
         else:
             out_weights_path = os.path.join(model_path, "decoder/iteration_{}".format(iteration))
             os.makedirs(out_weights_path, exist_ok=True)
-        if self._gate_used:
+        if self._gate_used and self.gate_uses_view_context:
+            weights = (
+                self.encoder.state_dict(),
+                self.decoder.state_dict(),
+                self.gate_allocator.state_dict(),
+                self.view_context_encoder.state_dict(),
+            )
+        elif self._gate_used:
             weights = (self.encoder.state_dict(), self.decoder.state_dict(), self.gate_allocator.state_dict())
         else:
             weights = (self.encoder.state_dict(), self.decoder.state_dict())
@@ -541,7 +707,10 @@ class MixGSModel:
         print("Load weight:", weights_path)
         weights = torch.load(weights_path, map_location='cuda')
         gate_weight = None
-        if isinstance(weights, (tuple, list)) and len(weights) == 3:
+        view_context_weight = None
+        if isinstance(weights, (tuple, list)) and len(weights) == 4:
+            grid_weight, network_weight, gate_weight, view_context_weight = weights
+        elif isinstance(weights, (tuple, list)) and len(weights) == 3:
             grid_weight, network_weight, gate_weight = weights
         elif isinstance(weights, (tuple, list)) and len(weights) == 2:
             grid_weight, network_weight = weights
@@ -558,6 +727,11 @@ class MixGSModel:
                 self._gate_used = True
             except RuntimeError as exc:
                 print("Gate allocator state dict skipped due to incompatible shape:", exc)
+        if view_context_weight is not None and self.view_context_encoder is not None:
+            try:
+                self.view_context_encoder.load_state_dict(view_context_weight)
+            except RuntimeError as exc:
+                print("View context state dict skipped due to incompatible shape:", exc)
         self.encoder.load_state_dict(grid_weight)
 
     def update_learning_rate(self, iteration):

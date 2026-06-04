@@ -63,9 +63,14 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             gaussians.get_rotation[vis_mask].detach(),
             gaussians.get_offset_slots[vis_mask].detach(),
         ]
+        camera_center = cam_info.get("camera_center")
+        if isinstance(camera_center, torch.Tensor):
+            while camera_center.dim() > 1:
+                camera_center = camera_center[0]
         decoded_data = mixgs.step(
             hash_input,
             cam_info['world_view_transform'][0][-1, :-1],
+            camera_center=camera_center,
             render_gaussian_budget=render_gaussian_budget,
             scale_min=getattr(pipeline, "scale_min", 0.0),
             allocation_mode=getattr(pipeline, "allocation_mode", "proposal"),
@@ -77,6 +82,9 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             gate_temperature_max_steps=getattr(pipeline, "gate_temperature_max_steps", 30000),
             gate_budget_lambda=getattr(pipeline, "gate_budget_lambda", 0.01),
             gate_binary_lambda=getattr(pipeline, "gate_binary_lambda", 0.001),
+            gate_feature_mode=getattr(pipeline, "gate_feature_mode", "detail_view"),
+            gate_opacity_mode=getattr(pipeline, "gate_opacity_mode", "st_identity"),
+            gate_all_detail_until=getattr(pipeline, "gate_all_detail_until", 0),
         )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 
@@ -137,6 +145,8 @@ def render_sets(dataset : ModelParams, opt, iteration : int, pipeline : Pipeline
             net_args=dataset.network_args,
             max_detail_slots=getattr(dataset, "detail_max_slots", 1),
             detail_count_choices=detail_count_choices,
+            gate_feature_mode=getattr(pipeline, "gate_feature_mode", "detail_view"),
+            gate_view_context_dim=getattr(pipeline, "gate_view_context_dim", 32),
         )
         mixgs.load_weights(dataset.model_path, iteration)
 

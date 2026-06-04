@@ -183,6 +183,7 @@ class TrainingResourceLogger:
         "stage_budget_reference_vram_mb",
         "stage_budget_observed_vram_mb",
         "allocation_mode_id",
+        "allocation_warmup_active",
         "gate_temperature",
         "gate_mass",
         "gate_mean",
@@ -190,6 +191,12 @@ class TrainingResourceLogger:
         "gate_min",
         "gate_budget_loss",
         "gate_binary_loss",
+        "gate_utility_loss",
+        "gate_utility_samples",
+        "gate_utility_mean",
+        "gate_utility_positive_ratio",
+        "gate_utility_eval_time_ms",
+        "gate_utility_view_bins",
     ]
     VRAM_FIELDS = [
         "vram_allocated_mb",
