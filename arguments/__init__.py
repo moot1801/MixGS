@@ -88,8 +88,6 @@ class PipelineParams(ParamGroup):
         self.gate_utility_interval = 100
         self.gate_utility_sample_count = 64
         self.gate_utility_group_size = 8
-        self.gate_utility_ema_decay = 0.95
-        self.gate_utility_ema_view_bins = 1
         self.gate_utility_min_delta = 0.0
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75

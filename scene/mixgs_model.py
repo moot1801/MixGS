@@ -455,6 +455,25 @@ class MixGSModel:
         rotate_detail = rotate_input[:, None, :].expand(-1, slot_count, -1).reshape(-1, rotate_input.shape[-1])
 
         detail_spatial_h = self.encoder.encode_xyz(candidate_xyz.detach())
+        mode = str(gate_feature_mode or self.gate_feature_mode or "detail_view").lower()
+        view_context = None
+        if mode in ("hash_view_context", "view_context"):
+            if not self.gate_uses_view_context or self.view_context_encoder is None:
+                raise ValueError(
+                    "MixGSModel must be constructed with gate_feature_mode='hash_view_context' "
+                    "to use view context gate features."
+                )
+            view_context = self._view_context_feature(coords, scale_input, camera_center)
+        gate_feature = self._gate_input_feature(
+            detail_spatial_h,
+            candidate_xyz,
+            camera_center,
+            mode,
+            candidate_offset=candidate_offset,
+            candidate_slot_idx=candidate_slot_idx,
+            slot_count=slot_count,
+            view_context=view_context,
+        )
         if render_gaussian_budget <= 0 or warmup_all_detail:
             selected_idx = torch.arange(full_detail_budget, device=coords.device, dtype=torch.long)
             selected_gate = coords.new_ones(full_detail_budget)
@@ -469,26 +488,24 @@ class MixGSModel:
                 "gate_budget_loss": 0.0,
                 "gate_binary_loss": 0.0,
             }
+            if warmup_all_detail and training:
+                gate_result = self.gate_allocator.select(
+                    gate_feature,
+                    full_detail_budget,
+                    training=True,
+                    train_mode="soft_all",
+                    eval_mode=gate_eval_mode,
+                    iteration=iteration,
+                    temperature_init=gate_temperature_init,
+                    temperature_final=gate_temperature_final,
+                    temperature_max_steps=gate_temperature_max_steps,
+                    budget_lambda=0.0,
+                    binary_lambda=0.0,
+                )
+                selected_logits = gate_result["logits"]
+                gate_losses = gate_result["losses"]
+                gate_stats = gate_result["stats"]
         else:
-            mode = str(gate_feature_mode or self.gate_feature_mode or "detail_view").lower()
-            view_context = None
-            if mode in ("hash_view_context", "view_context"):
-                if not self.gate_uses_view_context or self.view_context_encoder is None:
-                    raise ValueError(
-                        "MixGSModel must be constructed with gate_feature_mode='hash_view_context' "
-                        "to use view context gate features."
-                    )
-                view_context = self._view_context_feature(coords, scale_input, camera_center)
-            gate_feature = self._gate_input_feature(
-                detail_spatial_h,
-                candidate_xyz,
-                camera_center,
-                mode,
-                candidate_offset=candidate_offset,
-                candidate_slot_idx=candidate_slot_idx,
-                slot_count=slot_count,
-                view_context=view_context,
-            )
             gate_result = self.gate_allocator.select(
                 gate_feature,
                 detail_budget,

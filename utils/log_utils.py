@@ -196,7 +196,6 @@ class TrainingResourceLogger:
         "gate_utility_mean",
         "gate_utility_positive_ratio",
         "gate_utility_eval_time_ms",
-        "gate_utility_view_bins",
     ]
     VRAM_FIELDS = [
         "vram_allocated_mb",

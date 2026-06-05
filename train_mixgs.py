@@ -252,7 +252,6 @@ def _gate_utility_default_stats(device=None):
         "gate_utility_mean": 0.0,
         "gate_utility_positive_ratio": 0.0,
         "gate_utility_eval_time_ms": 0.0,
-        "gate_utility_view_bins": 0,
     }
 
 
@@ -289,33 +288,6 @@ def _gate_utility_ranking_loss(scores, targets, min_delta=0.0):
     return torch.nn.functional.softplus(-target_sign * score_diff[valid]).mean()
 
 
-def _gate_utility_key(anchor_id, slot_id, view_bin=0):
-    return int(anchor_id), int(slot_id), int(view_bin)
-
-
-def _gate_utility_view_bins(viewpoint, gaussians, vis_mask, decoded_data, bin_count):
-    anchor_idx = decoded_data.get("detail_anchor_idx")
-    if anchor_idx is None:
-        return None
-    bin_count = max(1, int(bin_count or 1))
-    if bin_count <= 1 or anchor_idx.numel() == 0:
-        return torch.zeros(anchor_idx.shape[0], device=anchor_idx.device, dtype=torch.long)
-    camera_center = _camera_center(viewpoint)
-    if camera_center is None:
-        return torch.zeros(anchor_idx.shape[0], device=anchor_idx.device, dtype=torch.long)
-    visible_xyz = gaussians.get_xyz[vis_mask].detach()
-    if not isinstance(camera_center, torch.Tensor):
-        camera_center = visible_xyz.new_tensor(camera_center)
-    camera_center = camera_center.to(device=visible_xyz.device, dtype=visible_xyz.dtype)
-    while camera_center.dim() > 1:
-        camera_center = camera_center[0]
-    selected_xyz = visible_xyz[anchor_idx.to(device=visible_xyz.device, dtype=torch.long)]
-    delta = camera_center.unsqueeze(0) - selected_xyz
-    angle = torch.atan2(delta[:, 1], delta[:, 0]) + 3.141592653589793
-    view_bins = torch.floor(angle / (2.0 * 3.141592653589793) * float(bin_count)).to(torch.long)
-    return view_bins.clamp_(0, bin_count - 1).to(device=anchor_idx.device)
-
-
 def _compute_gate_utility_loss(
         viewpoint,
         gaussians,
@@ -325,7 +297,6 @@ def _compute_gate_utility_loss(
         decoded_data,
         image,
         gt_image,
-        utility_ema,
         iteration,
 ):
     selected_logits = decoded_data.get("gate_selected_logits")
@@ -338,13 +309,9 @@ def _compute_gate_utility_loss(
     if selected_logits is None or selected_logits.numel() < 2:
         return zero_loss, stats
 
-    anchor_ids = decoded_data.get("gate_selected_anchor_idx")
-    slot_ids = decoded_data.get("gate_selected_slot_idx")
-    if anchor_ids is None or slot_ids is None:
+    interval = max(0, int(getattr(pipe, "gate_utility_interval", 100) or 0))
+    if interval <= 0 or int(iteration) % interval != 0:
         return zero_loss, stats
-
-    view_bin_count = max(1, int(getattr(pipe, "gate_utility_ema_view_bins", 1) or 1))
-    view_bins = _gate_utility_view_bins(viewpoint, gaussians, vis_mask, decoded_data, view_bin_count)
 
     selected_count = int(selected_logits.numel())
     sample_count = min(max(0, int(getattr(pipe, "gate_utility_sample_count", 64) or 0)), selected_count)
@@ -352,57 +319,39 @@ def _compute_gate_utility_loss(
         return zero_loss, stats
 
     sample_pos = torch.randperm(selected_count, device=device)[:sample_count]
-    interval = max(0, int(getattr(pipe, "gate_utility_interval", 100) or 0))
     group_size = max(1, int(getattr(pipe, "gate_utility_group_size", 8) or 1))
-    ema_decay = max(0.0, min(float(getattr(pipe, "gate_utility_ema_decay", 0.95) or 0.95), 0.9999))
     eval_time_ms = 0.0
+    utility_positions = []
+    utility_targets = []
 
-    if interval > 0 and int(iteration) % interval == 0:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        utility_start = time.time()
-        with torch.no_grad():
-            mse_with = _mse_metric(image.detach(), gt_image.detach())
-            for group_pos in torch.split(sample_pos, group_size):
-                keep_mask = torch.ones(selected_count, device=device, dtype=torch.bool)
-                keep_mask[group_pos] = False
-                masked_decoded = _decoded_data_with_detail_mask(decoded_data, keep_mask)
-                counterfactual_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, masked_decoded)
-                mse_without = _mse_metric(counterfactual_pkg["render"].detach(), gt_image.detach())
-                utility_value = float(((mse_without - mse_with) / max(1, int(group_pos.numel()))).item())
-                for pos in group_pos.detach().cpu().tolist():
-                    view_bin = 0 if view_bins is None else view_bins[pos].detach().cpu().item()
-                    key = _gate_utility_key(
-                        anchor_ids[pos].detach().cpu().item(),
-                        slot_ids[pos].detach().cpu().item(),
-                        view_bin,
-                    )
-                    previous = utility_ema.get(key)
-                    utility_ema[key] = utility_value if previous is None else ema_decay * previous + (1.0 - ema_decay) * utility_value
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        eval_time_ms = (time.time() - utility_start) * 1000.0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    utility_start = time.time()
+    with torch.no_grad():
+        mse_with = _mse_metric(image.detach(), gt_image.detach())
+        for group_pos in torch.split(sample_pos, group_size):
+            keep_mask = torch.ones(selected_count, device=device, dtype=torch.bool)
+            keep_mask[group_pos] = False
+            masked_decoded = _decoded_data_with_detail_mask(decoded_data, keep_mask)
+            counterfactual_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, masked_decoded)
+            mse_without = _mse_metric(counterfactual_pkg["render"].detach(), gt_image.detach())
+            utility_value = (mse_without - mse_with) / max(1, int(group_pos.numel()))
+            utility_positions.append(group_pos.detach())
+            utility_targets.append(utility_value.to(dtype=selected_logits.dtype).expand(group_pos.numel()).detach())
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    eval_time_ms = (time.time() - utility_start) * 1000.0
 
-    known_positions = []
-    known_targets = []
-    for pos in sample_pos.detach().cpu().tolist():
-        view_bin = 0 if view_bins is None else view_bins[pos].detach().cpu().item()
-        key = _gate_utility_key(
-            anchor_ids[pos].detach().cpu().item(),
-            slot_ids[pos].detach().cpu().item(),
-            view_bin,
-        )
-        if key in utility_ema:
-            known_positions.append(pos)
-            known_targets.append(utility_ema[key])
-
-    if len(known_positions) < 2:
-        stats["gate_utility_eval_time_ms"] = eval_time_ms
-        stats["gate_utility_view_bins"] = int(view_bin_count)
+    if not utility_positions:
+        stats["gate_utility_eval_time_ms"] = float(eval_time_ms)
         return zero_loss, stats
 
-    known_pos_tensor = torch.tensor(known_positions, device=device, dtype=torch.long)
-    targets = torch.tensor(known_targets, device=device, dtype=selected_logits.dtype)
+    known_pos_tensor = torch.cat(utility_positions, dim=0).to(device=device, dtype=torch.long)
+    targets = torch.cat(utility_targets, dim=0).to(device=device, dtype=selected_logits.dtype)
+    if known_pos_tensor.numel() < 2:
+        stats["gate_utility_eval_time_ms"] = float(eval_time_ms)
+        return zero_loss, stats
+
     scores = selected_logits[known_pos_tensor]
     utility_loss = _gate_utility_ranking_loss(
         scores,
@@ -414,11 +363,10 @@ def _compute_gate_utility_loss(
     with torch.no_grad():
         stats.update({
             "gate_utility_loss": float(utility_loss.detach().item()),
-            "gate_utility_samples": int(len(known_positions)),
+            "gate_utility_samples": int(targets.numel()),
             "gate_utility_mean": float(targets.detach().mean().item()),
             "gate_utility_positive_ratio": float((targets.detach() > 0).to(torch.float32).mean().item()),
             "gate_utility_eval_time_ms": float(eval_time_ms),
-            "gate_utility_view_bins": int(view_bin_count),
         })
     return utility_loss, stats
 
@@ -488,7 +436,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     ema_loss_for_log = 0.0
     ema_time_render = 0.0
     ema_time_loss = 0.0
-    gate_utility_ema = {}
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     iteration = first_iter
@@ -563,7 +510,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                 decoded_data,
                 image,
                 gt_image,
-                gate_utility_ema,
                 iteration,
             )
             loss = loss + gate_utility_loss

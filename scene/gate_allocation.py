@@ -65,11 +65,15 @@ class GateAllocator(nn.Module):
         loss = soft_gate.new_zeros(())
         budget_loss = soft_gate.new_zeros(())
         binary_loss = soft_gate.new_zeros(())
+        budget_weight = float(budget_lambda)
+        binary_weight = float(binary_lambda)
         if training and detail_budget > 0:
-            budget = soft_gate.new_tensor(float(detail_budget))
-            budget_loss = ((soft_gate.sum() - budget) / torch.clamp_min(budget, 1.0)).pow(2)
-            binary_loss = (soft_gate * (1.0 - soft_gate)).mean()
-            loss = float(budget_lambda) * budget_loss + float(binary_lambda) * binary_loss
+            if budget_weight != 0.0:
+                budget = soft_gate.new_tensor(float(detail_budget))
+                budget_loss = ((soft_gate.sum() - budget) / torch.clamp_min(budget, 1.0)).pow(2)
+            if binary_weight != 0.0:
+                binary_loss = (soft_gate * (1.0 - soft_gate)).mean()
+            loss = budget_weight * budget_loss + binary_weight * binary_loss
 
         stats = {
             "gate_temperature": float(temperature),

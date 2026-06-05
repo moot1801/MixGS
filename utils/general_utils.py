@@ -291,8 +291,6 @@ def get_default_pp():
     pp.gate_utility_interval = 100
     pp.gate_utility_sample_count = 64
     pp.gate_utility_group_size = 8
-    pp.gate_utility_ema_decay = 0.95
-    pp.gate_utility_ema_view_bins = 1
     pp.gate_utility_min_delta = 0.0
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
