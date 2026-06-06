@@ -240,6 +240,8 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
             net_args=dataset.network_args,
             max_detail_slots=getattr(dataset, "detail_max_slots", 1),
             detail_count_choices=detail_count_choices,
+            gate_feature_mode=getattr(pipeline, "gate_feature_mode", "detail_view"),
+            gate_view_context_dim=getattr(pipeline, "gate_view_context_dim", 32),
         )
         mixgs.load_weights(dataset.model_path, iteration)
         budget_decay_schedule = StageBudgetDecaySchedule(

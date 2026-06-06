@@ -67,7 +67,15 @@ def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.T
 
 
 
-def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, vis_mask, decoded_data, scaling_modifier=1.0):
+def render_mix(
+        viewpoint_camera,
+        pc: GaussianModel,
+        pipe,
+        bg_color: torch.Tensor,
+        vis_mask,
+        decoded_data,
+        scaling_modifier=1.0,
+        capture_viewspace_grad=False):
     """
     Render the scene.
 
@@ -123,6 +131,12 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     rotations = torch.cat([rotations, ori_rotations], dim=0)
 
     screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, device="cuda")
+    if capture_viewspace_grad:
+        screenspace_points.requires_grad_(True)
+        try:
+            screenspace_points.retain_grad()
+        except Exception:
+            pass
 
     tanfovx = math.tan(viewpoint_camera["FoVx"] * 0.5)
     tanfovy = math.tan(viewpoint_camera["FoVy"] * 0.5)
@@ -163,5 +177,6 @@ def render_mix(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             "radii": radii,
             "depth": depth_image,
             "scale": res_scales,
+            "viewspace_points": screenspace_points if capture_viewspace_grad else None,
             "budget_stats": decoded_data.get("budget_stats", {}),
             }

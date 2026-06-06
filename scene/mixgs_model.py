@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scene.network import GSDecoder, GSEncoder
-from scene.gate_allocation import GateAllocator
+from scene.gate_allocation import GateAllocator, SlotGateSTAllocator
 import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func, resolve_detail_count_choices
@@ -63,7 +63,12 @@ class MixGSModel:
         self.gate_extra_dim = self.view_context_encoder.context_dim if self.gate_uses_view_context else 8
         self.gate_feature_dim = self.spatial_dim + self.gate_extra_dim
         self.gate_allocator = GateAllocator(self.gate_feature_dim).cuda()
+        self.slot_gate_allocator = SlotGateSTAllocator(self.gate_feature_dim).cuda()
         self._gate_used = False
+        self._slot_gate_used = False
+        self.clone_score_ema = None
+        self.clone_score_seen_ema = None
+        self._clone_score_used = False
 
         self.decoder_lr_scale = 50.0
         self.encoder_lr_scale = 100.0
@@ -176,6 +181,159 @@ class MixGSModel:
         starts = torch.cumsum(counts, dim=0) - counts
         slot_idx = torch.arange(anchor_idx.shape[0], device=counts.device) - torch.repeat_interleave(starts, counts)
         return anchor_idx, slot_idx.to(torch.long)
+
+    def _ensure_clone_score_buffers(self, anchor_indices):
+        if anchor_indices is None or anchor_indices.numel() == 0:
+            return
+        anchor_indices = anchor_indices.detach().to(dtype=torch.long)
+        required_size = int(anchor_indices.max().item()) + 1
+        device = anchor_indices.device
+        if self.clone_score_ema is None:
+            self.clone_score_ema = torch.zeros(required_size, dtype=torch.float32, device=device)
+            self.clone_score_seen_ema = torch.zeros(required_size, dtype=torch.float32, device=device)
+            return
+        if self.clone_score_ema.device != device:
+            self.clone_score_ema = self.clone_score_ema.to(device=device)
+            self.clone_score_seen_ema = self.clone_score_seen_ema.to(device=device)
+        if self.clone_score_ema.shape[0] < required_size:
+            pad_size = required_size - self.clone_score_ema.shape[0]
+            self.clone_score_ema = torch.cat([
+                self.clone_score_ema,
+                torch.zeros(pad_size, dtype=self.clone_score_ema.dtype, device=device),
+            ], dim=0)
+            self.clone_score_seen_ema = torch.cat([
+                self.clone_score_seen_ema,
+                torch.zeros(pad_size, dtype=self.clone_score_seen_ema.dtype, device=device),
+            ], dim=0)
+
+    def _clone_visible_scores(self, anchor_indices, coords, eps=1e-6):
+        if anchor_indices is None or anchor_indices.numel() == 0:
+            return coords.new_ones((coords.shape[0],))
+        self._ensure_clone_score_buffers(anchor_indices)
+        if self.clone_score_ema is None:
+            return coords.new_ones((coords.shape[0],))
+        anchor_indices = anchor_indices.to(device=self.clone_score_ema.device, dtype=torch.long)
+        seen = self.clone_score_seen_ema[anchor_indices]
+        score = self.clone_score_ema[anchor_indices] / (seen + float(eps))
+        score = torch.where(seen > float(eps), score, torch.ones_like(score))
+        score = torch.nan_to_num(score, nan=1.0, posinf=1.0, neginf=0.0)
+        return torch.clamp_min(score.to(device=coords.device, dtype=coords.dtype), 0.0)
+
+    @staticmethod
+    def _clone_score_stage(training, iteration, warmup_until, ramp_until, freeze_after):
+        if iteration is None:
+            return "fixed", 2.0, False
+        iteration = int(iteration)
+        warmup_until = int(warmup_until or 0)
+        ramp_until = int(ramp_until or 0)
+        freeze_after = int(freeze_after or 0)
+        if warmup_until > 0 and iteration <= warmup_until:
+            return "warmup", 0.0, False
+        if ramp_until > warmup_until and iteration <= ramp_until:
+            return "ramp", 1.0, False
+        if freeze_after > 0 and iteration > freeze_after:
+            return "freeze", 3.0, True
+        return "fixed", 2.0, False
+
+    @staticmethod
+    def _clone_stage_detail_budget(
+            visible_count,
+            max_detail_slots,
+            render_gaussian_budget,
+            stage_name,
+            iteration,
+            warmup_until,
+            ramp_until):
+        full_detail_budget = int(visible_count) * int(max_detail_slots)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        if render_gaussian_budget <= 0:
+            target_detail_budget = full_detail_budget
+        else:
+            target_detail_budget = max(render_gaussian_budget - int(visible_count), 0)
+            target_detail_budget = min(target_detail_budget, full_detail_budget)
+
+        if stage_name == "warmup":
+            detail_budget = full_detail_budget
+            ramp_progress = 0.0
+        elif stage_name == "ramp":
+            warmup_until = int(warmup_until or 0)
+            ramp_until = int(ramp_until or 0)
+            denom = max(1, ramp_until - warmup_until)
+            ramp_progress = max(0.0, min(1.0, (int(iteration) - warmup_until) / float(denom)))
+            detail_budget = int(round(full_detail_budget + (target_detail_budget - full_detail_budget) * ramp_progress))
+        else:
+            detail_budget = target_detail_budget
+            ramp_progress = 1.0
+        detail_budget = max(0, min(int(detail_budget), full_detail_budget))
+        return target_detail_budget, detail_budget, int(visible_count) + detail_budget, ramp_progress
+
+    @staticmethod
+    def _clone_score_update_default_stats(frozen=False):
+        return {
+            "clone_score_updated_count": 0,
+            "clone_score_signal_mean": 0.0,
+            "clone_score_signal_max": 0.0,
+            "clone_score_frozen": int(bool(frozen)),
+        }
+
+    def update_clone_scores(
+            self,
+            render_pkg,
+            decoded_data,
+            ema_beta=0.95,
+            eps=1e-6,
+            detail_grad_weight=1.0,
+            grad_clip=0.0,
+            frozen=False):
+        if frozen:
+            return self._clone_score_update_default_stats(frozen=True)
+        if not self._clone_score_used:
+            return self._clone_score_update_default_stats(frozen=False)
+        viewspace_points = render_pkg.get("viewspace_points") if render_pkg is not None else None
+        if viewspace_points is None or viewspace_points.grad is None:
+            return self._clone_score_update_default_stats(frozen=False)
+        anchor_indices = decoded_data.get("anchor_indices") if decoded_data is not None else None
+        if anchor_indices is None or anchor_indices.numel() == 0:
+            return self._clone_score_update_default_stats(frozen=False)
+
+        anchor_indices = anchor_indices.detach().to(device=viewspace_points.device, dtype=torch.long)
+        visible_count = int(anchor_indices.numel())
+        detail_anchor_idx = decoded_data.get("detail_anchor_idx")
+        detail_count = int(detail_anchor_idx.numel()) if detail_anchor_idx is not None else 0
+        grad_norm = viewspace_points.grad.detach().norm(dim=-1).to(torch.float32)
+        if grad_norm.numel() < detail_count + visible_count:
+            return self._clone_score_update_default_stats(frozen=False)
+
+        base_signal = grad_norm[detail_count:detail_count + visible_count]
+        signal = base_signal.clone()
+        if detail_count > 0 and float(detail_grad_weight or 0.0) != 0.0:
+            detail_anchor_idx = detail_anchor_idx.detach().to(device=grad_norm.device, dtype=torch.long)
+            valid = (detail_anchor_idx >= 0) & (detail_anchor_idx < visible_count)
+            if torch.any(valid):
+                local_idx = detail_anchor_idx[valid]
+                detail_signal = grad_norm[:detail_count][valid] * float(detail_grad_weight)
+                accum = torch.zeros(visible_count, dtype=torch.float32, device=grad_norm.device)
+                counts = torch.zeros(visible_count, dtype=torch.float32, device=grad_norm.device)
+                accum.index_add_(0, local_idx, detail_signal)
+                counts.index_add_(0, local_idx, torch.ones_like(detail_signal))
+                detail_mean = accum / counts.clamp_min(1.0)
+                signal = torch.maximum(signal, detail_mean)
+
+        signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+        if float(grad_clip or 0.0) > 0.0:
+            signal = signal.clamp_max(float(grad_clip))
+        self._ensure_clone_score_buffers(anchor_indices)
+        ema_beta = max(0.0, min(0.9999, float(ema_beta)))
+        old_score = self.clone_score_ema[anchor_indices]
+        old_seen = self.clone_score_seen_ema[anchor_indices]
+        self.clone_score_ema[anchor_indices] = old_score * ema_beta + signal.to(old_score.dtype) * (1.0 - ema_beta)
+        self.clone_score_seen_ema[anchor_indices] = old_seen * ema_beta + (1.0 - ema_beta)
+        return {
+            "clone_score_updated_count": int(visible_count),
+            "clone_score_signal_mean": float(signal.mean().item()) if signal.numel() > 0 else 0.0,
+            "clone_score_signal_max": float(signal.max().item()) if signal.numel() > 0 else 0.0,
+            "clone_score_frozen": 0,
+        }
 
     def _empty_decoded_data(self, coords, detail_counts, budget_stats, gate_losses=None):
         decoded = {
@@ -313,7 +471,190 @@ class MixGSModel:
         extra_feature = self._match_gate_extra_dim(extra_feature)
         return torch.cat([spatial_feature, extra_feature], dim=-1)
 
-    def _step_proposal(self, coords, scale_input, rotate_input, offset_slots, pose, render_gaussian_budget=0, scale_min=0.0):
+    @staticmethod
+    def _detail_feature_mode(detail_feature_mode):
+        mode = str(detail_feature_mode or "detail_hash").lower()
+        if mode in (
+                "detail_hash",
+                "hash_detail",
+                "hash_detail_xyz",
+                "detail_xyz_hash",
+                "hash_anchor_xyz_offset",
+        ):
+            return "detail_hash"
+        if mode in (
+                "anchor_slot",
+                "anchor_h_slot",
+                "anchor_hidden_slot",
+                "anchor_feature_slot",
+                "anchor_slot_embedding",
+                "anchor_h+slot_embedding",
+        ):
+            return "anchor_slot"
+        raise ValueError(f"Unsupported detail_feature_mode: {detail_feature_mode}")
+
+    def _decode_detail_hidden(
+            self,
+            coords,
+            temporal_h,
+            scale_input,
+            rotate_input,
+            anchor_idx,
+            slot_idx,
+            detail_xyz=None,
+            detail_spatial_h=None,
+            detail_feature_mode="detail_hash",
+    ):
+        mode = self._detail_feature_mode(detail_feature_mode)
+        if mode == "anchor_slot":
+            anchor_spatial_h = self.encoder.encode_xyz(coords.detach())
+            anchor_h = self.decoder.compute_hidden(
+                anchor_spatial_h,
+                temporal_h,
+                scale_input,
+                rotate_input,
+            )
+            return anchor_h[anchor_idx]
+
+        if detail_spatial_h is None:
+            if detail_xyz is None:
+                raise ValueError("detail_xyz is required for detail_hash mode.")
+            detail_spatial_h = self.encoder.encode_xyz(detail_xyz.detach())
+        return self.decoder.compute_hidden(
+            detail_spatial_h,
+            temporal_h[anchor_idx],
+            scale_input[anchor_idx],
+            rotate_input[anchor_idx],
+        )
+
+    def _step_clone_score(
+            self,
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=0,
+            training=False,
+            iteration=None,
+            clone_score_warmup_until=20000,
+            clone_score_ramp_until=40000,
+            clone_score_freeze_after=220000,
+            clone_score_eps=1e-6,
+            anchor_indices=None,
+            detail_feature_mode="detail_hash"):
+        self._clone_score_used = True
+        temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
+        visible_count = coords.shape[0]
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        if anchor_indices is None:
+            anchor_indices = torch.arange(visible_count, dtype=torch.long, device=coords.device)
+        else:
+            anchor_indices = anchor_indices.to(device=coords.device, dtype=torch.long)
+        slot_count = min(offset_slots.shape[1], self.max_detail_slots)
+        if slot_count <= 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": visible_count > render_gaussian_budget > 0,
+                "allocation_mode_id": 3.0,
+                "clone_score_stage_id": 2.0,
+                "clone_score_stage": "fixed",
+                "clone_target_detail_budget": 0,
+                "clone_effective_detail_budget": 0,
+                "clone_target_render_gaussian_budget": render_gaussian_budget,
+                "clone_effective_render_gaussian_budget": visible_count,
+                "clone_score_mean": 0.0,
+                "clone_score_max": 0.0,
+                "clone_score_ramp_progress": 1.0,
+                "clone_score_frozen": 0,
+            }
+            decoded = self._empty_decoded_data(coords, detail_counts, budget_stats)
+            decoded["anchor_indices"] = anchor_indices
+            decoded["clone_score_update_enabled"] = bool(training)
+            return decoded
+
+        stage_name, stage_id, frozen = self._clone_score_stage(
+            training,
+            iteration,
+            clone_score_warmup_until,
+            clone_score_ramp_until,
+            clone_score_freeze_after,
+        )
+        target_detail_budget, effective_detail_budget, effective_render_budget, ramp_progress = self._clone_stage_detail_budget(
+            visible_count,
+            slot_count,
+            render_gaussian_budget,
+            stage_name,
+            iteration if iteration is not None else 0,
+            clone_score_warmup_until,
+            clone_score_ramp_until,
+        )
+        visible_scores = self._clone_visible_scores(anchor_indices, coords, eps=clone_score_eps)
+        allocation_scores = coords.new_ones((visible_count,)) if stage_name == "warmup" else visible_scores
+        detail_counts, budget_stats = self._allocate_detail_counts(allocation_scores, effective_render_budget)
+        budget_stats.update({
+            "allocation_mode_id": 3.0,
+            "clone_score_stage_id": stage_id,
+            "clone_score_stage": stage_name,
+            "clone_target_detail_budget": int(target_detail_budget),
+            "clone_effective_detail_budget": int(effective_detail_budget),
+            "clone_target_render_gaussian_budget": int(render_gaussian_budget),
+            "clone_effective_render_gaussian_budget": int(effective_render_budget),
+            "clone_score_mean": float(visible_scores.mean().item()) if visible_scores.numel() > 0 else 0.0,
+            "clone_score_max": float(visible_scores.max().item()) if visible_scores.numel() > 0 else 0.0,
+            "clone_score_ramp_progress": float(ramp_progress),
+            "clone_score_frozen": int(bool(frozen)),
+        })
+        anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
+
+        if anchor_idx.numel() > 0:
+            offset_slots = offset_slots[:, :slot_count]
+            detail_xyz = coords[anchor_idx] + offset_slots[anchor_idx, slot_idx]
+            detail_h = self._decode_detail_hidden(
+                coords,
+                temporal_h,
+                scale_input,
+                rotate_input,
+                anchor_idx,
+                slot_idx,
+                detail_xyz=detail_xyz,
+                detail_feature_mode=detail_feature_mode,
+            )
+            color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
+        else:
+            decoded = self._empty_decoded_data(coords, detail_counts, budget_stats)
+            decoded["anchor_indices"] = anchor_indices
+            decoded["clone_score_update_enabled"] = bool(training and not frozen)
+            return decoded
+
+        return {
+            "d_color": color,
+            "d_rotation": rotation,
+            "d_scaling": scaling,
+            "d_opacity": opacity,
+            "detail_anchor_idx": anchor_idx,
+            "detail_slot_idx": slot_idx,
+            "detail_counts": detail_counts,
+            "anchor_indices": anchor_indices,
+            "clone_score_update_enabled": bool(training and not frozen),
+            "budget_stats": budget_stats,
+        }
+
+    def _step_proposal(
+            self,
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=0,
+            scale_min=0.0,
+            detail_feature_mode="detail_hash",
+    ):
         temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         render_gaussian_budget = int(render_gaussian_budget or 0)
         full_detail_budget = coords.shape[0] * self.max_detail_slots
@@ -333,14 +674,17 @@ class MixGSModel:
 
         if anchor_idx.numel() > 0:
             detail_xyz = coords[anchor_idx] + offset_slots[anchor_idx, slot_idx]
-            detail_spatial_h = self.encoder.encode_xyz(detail_xyz.detach())
-            detail_h = self.decoder.compute_hidden(
-                detail_spatial_h,
-                temporal_h[anchor_idx],
-                scale_input[anchor_idx],
-                rotate_input[anchor_idx],
+            detail_h = self._decode_detail_hidden(
+                coords,
+                temporal_h,
+                scale_input,
+                rotate_input,
+                anchor_idx,
+                slot_idx,
+                detail_xyz=detail_xyz,
+                detail_feature_mode=detail_feature_mode,
             )
-            color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h)
+            color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
         else:
             return self._empty_decoded_data(coords, detail_counts, budget_stats)
 
@@ -400,6 +744,7 @@ class MixGSModel:
             gate_opacity_mode="st_identity",
             gate_all_detail_until=0,
             anchor_indices=None,
+            detail_feature_mode="detail_hash",
     ):
         self._gate_used = True
         visible_count = coords.shape[0]
@@ -545,13 +890,17 @@ class MixGSModel:
         else:
             selected_anchor_idx = anchor_idx
         detail_counts = torch.bincount(anchor_idx, minlength=visible_count).to(dtype=torch.long)
-        detail_h = self.decoder.compute_hidden(
-            detail_spatial_h[selected_idx],
-            temporal_detail[selected_idx],
-            scale_detail[selected_idx],
-            rotate_detail[selected_idx],
+        detail_h = self._decode_detail_hidden(
+            coords,
+            temporal_h,
+            scale_input,
+            rotate_input,
+            anchor_idx,
+            slot_idx,
+            detail_spatial_h=detail_spatial_h[selected_idx],
+            detail_feature_mode=detail_feature_mode,
         )
-        color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h)
+        color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
 
         opacity_mode = str(gate_opacity_mode or "st_identity").lower()
         if opacity_mode in ("multiply", "gate_multiply"):
@@ -592,6 +941,199 @@ class MixGSModel:
             "gate_slot_count": int(slot_count),
         }
 
+
+    def _step_slot_gate_st(
+            self,
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=0,
+            training=False,
+            iteration=None,
+            camera_center=None,
+            gate_train_mode="topk_st",
+            gate_eval_mode="topk",
+            gate_temperature_init=1.0,
+            gate_temperature_final=0.2,
+            gate_temperature_max_steps=30000,
+            gate_budget_lambda=0.0,
+            gate_binary_lambda=0.0,
+            gate_feature_mode="hash_view_context",
+            gate_opacity_mode="st_multiply",
+            gate_all_detail_until=0,
+            anchor_indices=None,
+            detail_feature_mode="detail_hash",
+    ):
+        self._slot_gate_used = True
+        visible_count = coords.shape[0]
+        slot_count = min(offset_slots.shape[1], self.max_detail_slots)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        full_detail_budget = visible_count * slot_count
+        budget_overflow = render_gaussian_budget > 0 and visible_count > render_gaussian_budget
+        warmup_all_detail = self._gate_all_detail_warmup_active(
+            training,
+            iteration,
+            gate_all_detail_until,
+        )
+
+        if visible_count == 0 or slot_count == 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                0,
+                0,
+                False,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            budget_stats["allocation_mode_id"] = 2.0
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, self._zero_gate_losses(coords))
+
+        if render_gaussian_budget <= 0 or warmup_all_detail:
+            detail_budget = full_detail_budget
+        else:
+            detail_budget = max(render_gaussian_budget - visible_count, 0)
+            detail_budget = min(detail_budget, full_detail_budget)
+
+        if detail_budget <= 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                0,
+                0,
+                budget_overflow,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            budget_stats["allocation_mode_id"] = 2.0
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, self._zero_gate_losses(coords))
+
+        offset_slots = offset_slots[:, :slot_count]
+        candidate_offset = offset_slots.reshape(-1, 3)
+        candidate_slot_idx = torch.arange(slot_count, device=coords.device, dtype=torch.long)
+        candidate_slot_idx = candidate_slot_idx.unsqueeze(0).expand(visible_count, -1).reshape(-1)
+        candidate_xyz = coords[:, None, :] + offset_slots
+        candidate_xyz = candidate_xyz.reshape(-1, 3)
+        temporal_h = pose.unsqueeze(0).repeat(visible_count, 1)
+        temporal_detail = temporal_h[:, None, :].expand(-1, slot_count, -1).reshape(-1, temporal_h.shape[-1])
+        scale_detail = scale_input[:, None, :].expand(-1, slot_count, -1).reshape(-1, scale_input.shape[-1])
+        rotate_detail = rotate_input[:, None, :].expand(-1, slot_count, -1).reshape(-1, rotate_input.shape[-1])
+
+        detail_spatial_h = self.encoder.encode_xyz(candidate_xyz.detach())
+        mode = str(gate_feature_mode or self.gate_feature_mode or "hash_view_context").lower()
+        view_context = None
+        if mode in ("hash_view_context", "view_context"):
+            if not self.gate_uses_view_context or self.view_context_encoder is None:
+                raise ValueError(
+                    "MixGSModel must be constructed with gate_feature_mode='hash_view_context' "
+                    "to use view context gate features."
+                )
+            view_context = self._view_context_feature(coords, scale_input, camera_center)
+        gate_feature = self._gate_input_feature(
+            detail_spatial_h,
+            candidate_xyz,
+            camera_center,
+            mode,
+            candidate_offset=candidate_offset,
+            candidate_slot_idx=candidate_slot_idx,
+            slot_count=slot_count,
+            view_context=view_context,
+        )
+
+        gate_result = self.slot_gate_allocator.select(
+            gate_feature,
+            detail_budget,
+            training=training,
+            train_mode=gate_train_mode,
+            eval_mode=gate_eval_mode,
+            iteration=iteration,
+            temperature_init=gate_temperature_init,
+            temperature_final=gate_temperature_final,
+            temperature_max_steps=gate_temperature_max_steps,
+            budget_lambda=gate_budget_lambda,
+            binary_lambda=gate_binary_lambda,
+        )
+        selected_idx = gate_result["selected_idx"]
+        selected_gate = gate_result["selected_gate"]
+        selected_logits = gate_result["logits"][selected_idx] if selected_idx.numel() > 0 else gate_result["logits"].new_empty(0)
+        gate_losses = gate_result["losses"]
+        gate_stats = gate_result["stats"]
+
+        if selected_idx.numel() == 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = self._gate_budget_stats(
+                render_gaussian_budget,
+                visible_count,
+                detail_budget,
+                0,
+                budget_overflow,
+                gate_stats,
+                allocation_warmup_active=warmup_all_detail,
+            )
+            budget_stats["allocation_mode_id"] = 2.0
+            return self._empty_decoded_data(coords, detail_counts, budget_stats, gate_losses)
+
+        anchor_idx = torch.div(selected_idx, slot_count, rounding_mode="floor")
+        slot_idx = selected_idx - anchor_idx * slot_count
+        if anchor_indices is not None:
+            selected_anchor_idx = anchor_indices.to(device=coords.device, dtype=torch.long)[anchor_idx]
+        else:
+            selected_anchor_idx = anchor_idx
+        detail_counts = torch.bincount(anchor_idx, minlength=visible_count).to(dtype=torch.long)
+        detail_h = self._decode_detail_hidden(
+            coords,
+            temporal_h,
+            scale_input,
+            rotate_input,
+            anchor_idx,
+            slot_idx,
+            detail_spatial_h=detail_spatial_h[selected_idx],
+            detail_feature_mode=detail_feature_mode,
+        )
+        color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
+
+        opacity_mode = str(gate_opacity_mode or "st_multiply").lower()
+        if opacity_mode in ("multiply", "gate_multiply", "st_multiply", "straight_through_multiply"):
+            opacity = opacity * selected_gate.unsqueeze(-1)
+        elif opacity_mode in ("st_identity", "straight_through", "identity_st"):
+            if training:
+                gate_multiplier = 1.0 + selected_gate.unsqueeze(-1) - selected_gate.detach().unsqueeze(-1)
+                opacity = opacity * gate_multiplier
+        elif opacity_mode in ("none", "identity"):
+            pass
+        else:
+            raise ValueError(f"Unsupported gate_opacity_mode: {gate_opacity_mode}")
+
+        budget_stats = self._gate_budget_stats(
+            render_gaussian_budget,
+            visible_count,
+            detail_budget,
+            selected_idx.numel(),
+            budget_overflow,
+            gate_stats,
+            allocation_warmup_active=warmup_all_detail,
+        )
+        budget_stats["allocation_mode_id"] = 2.0
+
+        return {
+            "d_color": color,
+            "d_rotation": rotation,
+            "d_scaling": scaling,
+            "d_opacity": opacity,
+            "detail_anchor_idx": anchor_idx,
+            "detail_slot_idx": slot_idx.to(torch.long),
+            "detail_counts": detail_counts,
+            "budget_stats": budget_stats,
+            "gate_losses": gate_losses,
+            "gate_selected_idx": selected_idx.to(torch.long),
+            "gate_selected_logits": selected_logits,
+            "gate_selected_anchor_idx": selected_anchor_idx.to(torch.long),
+            "gate_selected_slot_idx": slot_idx.to(torch.long),
+            "gate_slot_count": int(slot_count),
+        }
+
     def step(
             self,
             data,
@@ -612,6 +1154,14 @@ class MixGSModel:
             gate_feature_mode="detail_view",
             gate_opacity_mode="st_identity",
             gate_all_detail_until=0,
+            clone_score_warmup_until=20000,
+            clone_score_ramp_until=40000,
+            clone_score_freeze_after=220000,
+            clone_score_ema_beta=0.95,
+            clone_score_eps=1e-6,
+            clone_score_detail_grad_weight=1.0,
+            clone_score_grad_clip=0.0,
+            detail_feature_mode="detail_hash",
     ):
         coords = data[0]
         scale_input = data[1]
@@ -626,6 +1176,47 @@ class MixGSModel:
             anchor_indices = anchor_indices.to(device=coords.device, dtype=torch.long)
 
         mode = str(allocation_mode or "proposal").lower()
+        if mode in ("clone_score", "clone_score_allocation"):
+            return self._step_clone_score(
+                coords,
+                scale_input,
+                rotate_input,
+                offset_slots,
+                pose,
+                render_gaussian_budget=render_gaussian_budget,
+                training=training,
+                iteration=iteration,
+                clone_score_warmup_until=clone_score_warmup_until,
+                clone_score_ramp_until=clone_score_ramp_until,
+                clone_score_freeze_after=clone_score_freeze_after,
+                clone_score_eps=clone_score_eps,
+                anchor_indices=anchor_indices,
+                detail_feature_mode=detail_feature_mode,
+            )
+        if mode in ("slot_gate_st", "slot_st_gate", "st_slot_gate"):
+            return self._step_slot_gate_st(
+                coords,
+                scale_input,
+                rotate_input,
+                offset_slots,
+                pose,
+                render_gaussian_budget=render_gaussian_budget,
+                training=training,
+                iteration=iteration,
+                camera_center=camera_center,
+                gate_train_mode=gate_train_mode,
+                gate_eval_mode=gate_eval_mode,
+                gate_temperature_init=gate_temperature_init,
+                gate_temperature_final=gate_temperature_final,
+                gate_temperature_max_steps=gate_temperature_max_steps,
+                gate_budget_lambda=gate_budget_lambda,
+                gate_binary_lambda=gate_binary_lambda,
+                gate_feature_mode=gate_feature_mode,
+                gate_opacity_mode=gate_opacity_mode,
+                gate_all_detail_until=gate_all_detail_until,
+                anchor_indices=anchor_indices,
+                detail_feature_mode=detail_feature_mode,
+            )
         if mode in ("gate", "learned_gate"):
             return self._step_gate(
                 coords,
@@ -648,6 +1239,7 @@ class MixGSModel:
                 gate_opacity_mode=gate_opacity_mode,
                 gate_all_detail_until=gate_all_detail_until,
                 anchor_indices=anchor_indices,
+                detail_feature_mode=detail_feature_mode,
             )
         if mode not in ("proposal", "decoder", "decoder_proposal", ""):
             raise ValueError(f"Unsupported allocation_mode: {allocation_mode}")
@@ -659,6 +1251,7 @@ class MixGSModel:
             pose,
             render_gaussian_budget=render_gaussian_budget,
             scale_min=scale_min,
+            detail_feature_mode=detail_feature_mode,
         )
 
     def train_setting(self, training_args):
@@ -672,7 +1265,7 @@ class MixGSModel:
             {'params': list(self.encoder.parameters()),
              'lr': training_args.position_lr_init * self.encoder_lr_scale,
              "name": "encoder"},
-            {'params': list(self.gate_allocator.parameters()) + (
+            {'params': list(self.gate_allocator.parameters()) + list(self.slot_gate_allocator.parameters()) + (
                 list(self.view_context_encoder.parameters())
                 if self.gate_uses_view_context and self.view_context_encoder is not None else []
             ),
@@ -700,7 +1293,20 @@ class MixGSModel:
         else:
             out_weights_path = os.path.join(model_path, "decoder/iteration_{}".format(iteration))
             os.makedirs(out_weights_path, exist_ok=True)
-        if self._gate_used and self.gate_uses_view_context:
+        if self._slot_gate_used or self._clone_score_used:
+            weights = {
+                "encoder": self.encoder.state_dict(),
+                "decoder": self.decoder.state_dict(),
+                "gate_allocator": self.gate_allocator.state_dict() if self._gate_used else None,
+                "slot_gate_allocator": self.slot_gate_allocator.state_dict() if self._slot_gate_used else None,
+                "view_context_encoder": (
+                    self.view_context_encoder.state_dict()
+                    if self.gate_uses_view_context and self.view_context_encoder is not None else None
+                ),
+                "clone_score_ema": self.clone_score_ema.detach().cpu() if self.clone_score_ema is not None else None,
+                "clone_score_seen_ema": self.clone_score_seen_ema.detach().cpu() if self.clone_score_seen_ema is not None else None,
+            }
+        elif self._gate_used and self.gate_uses_view_context:
             weights = (
                 self.encoder.state_dict(),
                 self.decoder.state_dict(),
@@ -724,8 +1330,19 @@ class MixGSModel:
         print("Load weight:", weights_path)
         weights = torch.load(weights_path, map_location='cuda')
         gate_weight = None
+        slot_gate_weight = None
         view_context_weight = None
-        if isinstance(weights, (tuple, list)) and len(weights) == 4:
+        clone_score_ema = None
+        clone_score_seen_ema = None
+        if isinstance(weights, dict):
+            grid_weight = weights["encoder"]
+            network_weight = weights["decoder"]
+            gate_weight = weights.get("gate_allocator")
+            slot_gate_weight = weights.get("slot_gate_allocator")
+            view_context_weight = weights.get("view_context_encoder")
+            clone_score_ema = weights.get("clone_score_ema")
+            clone_score_seen_ema = weights.get("clone_score_seen_ema")
+        elif isinstance(weights, (tuple, list)) and len(weights) == 4:
             grid_weight, network_weight, gate_weight, view_context_weight = weights
         elif isinstance(weights, (tuple, list)) and len(weights) == 3:
             grid_weight, network_weight, gate_weight = weights
@@ -744,11 +1361,21 @@ class MixGSModel:
                 self._gate_used = True
             except RuntimeError as exc:
                 print("Gate allocator state dict skipped due to incompatible shape:", exc)
+        if slot_gate_weight is not None:
+            try:
+                self.slot_gate_allocator.load_state_dict(slot_gate_weight)
+                self._slot_gate_used = True
+            except RuntimeError as exc:
+                print("Slot gate allocator state dict skipped due to incompatible shape:", exc)
         if view_context_weight is not None and self.view_context_encoder is not None:
             try:
                 self.view_context_encoder.load_state_dict(view_context_weight)
             except RuntimeError as exc:
                 print("View context state dict skipped due to incompatible shape:", exc)
+        if clone_score_ema is not None and clone_score_seen_ema is not None:
+            self.clone_score_ema = clone_score_ema.detach().to(device="cuda", dtype=torch.float32)
+            self.clone_score_seen_ema = clone_score_seen_ema.detach().to(device="cuda", dtype=torch.float32)
+            self._clone_score_used = True
         self.encoder.load_state_dict(grid_weight)
 
     def update_learning_rate(self, iteration):

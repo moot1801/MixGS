@@ -62,6 +62,7 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             gaussians.get_scaling[vis_mask].detach(),
             gaussians.get_rotation[vis_mask].detach(),
             gaussians.get_offset_slots[vis_mask].detach(),
+            torch.nonzero(vis_mask, as_tuple=False).flatten().detach(),
         ]
         camera_center = cam_info.get("camera_center")
         if isinstance(camera_center, torch.Tensor):
@@ -83,8 +84,16 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             gate_budget_lambda=getattr(pipeline, "gate_budget_lambda", 0.01),
             gate_binary_lambda=getattr(pipeline, "gate_binary_lambda", 0.001),
             gate_feature_mode=getattr(pipeline, "gate_feature_mode", "detail_view"),
+            detail_feature_mode=getattr(pipeline, "detail_feature_mode", "detail_hash"),
             gate_opacity_mode=getattr(pipeline, "gate_opacity_mode", "st_identity"),
             gate_all_detail_until=getattr(pipeline, "gate_all_detail_until", 0),
+            clone_score_warmup_until=getattr(pipeline, "clone_score_warmup_until", 20000),
+            clone_score_ramp_until=getattr(pipeline, "clone_score_ramp_until", 40000),
+            clone_score_freeze_after=getattr(pipeline, "clone_score_freeze_after", 220000),
+            clone_score_ema_beta=getattr(pipeline, "clone_score_ema_beta", 0.95),
+            clone_score_eps=getattr(pipeline, "clone_score_eps", 1e-6),
+            clone_score_detail_grad_weight=getattr(pipeline, "clone_score_detail_grad_weight", 1.0),
+            clone_score_grad_clip=getattr(pipeline, "clone_score_grad_clip", 0.0),
         )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 

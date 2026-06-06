@@ -207,8 +207,16 @@ def _gate_step_kwargs(pipe, iteration=None, training=False):
         "gate_budget_lambda": getattr(pipe, "gate_budget_lambda", 0.01),
         "gate_binary_lambda": getattr(pipe, "gate_binary_lambda", 0.001),
         "gate_feature_mode": getattr(pipe, "gate_feature_mode", "detail_view"),
+        "detail_feature_mode": getattr(pipe, "detail_feature_mode", "detail_hash"),
         "gate_opacity_mode": getattr(pipe, "gate_opacity_mode", "st_identity"),
         "gate_all_detail_until": getattr(pipe, "gate_all_detail_until", 0),
+        "clone_score_warmup_until": getattr(pipe, "clone_score_warmup_until", 20000),
+        "clone_score_ramp_until": getattr(pipe, "clone_score_ramp_until", 40000),
+        "clone_score_freeze_after": getattr(pipe, "clone_score_freeze_after", 220000),
+        "clone_score_ema_beta": getattr(pipe, "clone_score_ema_beta", 0.95),
+        "clone_score_eps": getattr(pipe, "clone_score_eps", 1e-6),
+        "clone_score_detail_grad_weight": getattr(pipe, "clone_score_detail_grad_weight", 1.0),
+        "clone_score_grad_clip": getattr(pipe, "clone_score_grad_clip", 0.0),
     }
 
 
@@ -224,7 +232,20 @@ def _render_with_allocation_budget(
         scale_min=getattr(pipe, "scale_min", 0.0),
         **_gate_step_kwargs(pipe, iteration=iteration, training=training),
     )
-    render_pkg = render_mix(viewpoint, gaussians, pipe, background, vis_mask, decoded_data)
+    allocation_mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
+    capture_clone_grad = allocation_mode in ("clone_score", "clone_score_allocation") and bool(training)
+    if capture_clone_grad:
+        freeze_after = int(getattr(pipe, "clone_score_freeze_after", 220000) or 0)
+        capture_clone_grad = iteration is None or freeze_after <= 0 or int(iteration) <= freeze_after
+    render_pkg = render_mix(
+        viewpoint,
+        gaussians,
+        pipe,
+        background,
+        vis_mask,
+        decoded_data,
+        capture_viewspace_grad=capture_clone_grad,
+    )
     return render_pkg, decoded_data
 
 
@@ -515,6 +536,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             loss = loss + gate_utility_loss
 
             loss.backward()
+            clone_score_update_stats = mixgs.update_clone_scores(
+                render_pkg,
+                decoded_data,
+                ema_beta=getattr(pipe, "clone_score_ema_beta", 0.95),
+                eps=getattr(pipe, "clone_score_eps", 1e-6),
+                detail_grad_weight=getattr(pipe, "clone_score_detail_grad_weight", 1.0),
+                grad_clip=getattr(pipe, "clone_score_grad_clip", 0.0),
+                frozen=bool(decoded_data.get("clone_score_update_enabled") is False),
+            ) if str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower() in ("clone_score", "clone_score_allocation") else {}
             end = time.time()
             ema_time_loss = 0.4 * (end - start) + 0.6 * ema_time_loss
 
@@ -531,6 +561,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 
                 budget_stats = render_pkg.get("budget_stats", {})
                 budget_stats.update(gate_utility_stats)
+                budget_stats.update(clone_score_update_stats)
                 observed_vram_mb = 0.0
                 if torch.cuda.is_available():
                     observed_vram_mb = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
@@ -573,6 +604,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "gate_utility_mean": budget_stats.get("gate_utility_mean", 0.0),
                     "gate_utility_positive_ratio": budget_stats.get("gate_utility_positive_ratio", 0.0),
                     "gate_utility_eval_time_ms": budget_stats.get("gate_utility_eval_time_ms", 0.0),
+                    "clone_score_stage_id": budget_stats.get("clone_score_stage_id", 0.0),
+                    "clone_score_mean": budget_stats.get("clone_score_mean", 0.0),
+                    "clone_score_max": budget_stats.get("clone_score_max", 0.0),
+                    "clone_score_updated_count": budget_stats.get("clone_score_updated_count", 0),
+                    "clone_score_signal_mean": budget_stats.get("clone_score_signal_mean", 0.0),
+                    "clone_score_signal_max": budget_stats.get("clone_score_signal_max", 0.0),
+                    "clone_score_frozen": budget_stats.get("clone_score_frozen", 0),
+                    "clone_target_detail_budget": budget_stats.get("clone_target_detail_budget", 0),
+                    "clone_effective_detail_budget": budget_stats.get("clone_effective_detail_budget", 0),
+                    "clone_score_ramp_progress": budget_stats.get("clone_score_ramp_progress", 0.0),
                 }
 
                 lr = {}
@@ -702,6 +743,20 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
         ):
             if key in ema_time:
                 metrics_to_log["train_gate/" + key] = ema_time[key]
+        for key in (
+            "clone_score_stage_id",
+            "clone_score_mean",
+            "clone_score_max",
+            "clone_score_updated_count",
+            "clone_score_signal_mean",
+            "clone_score_signal_max",
+            "clone_score_frozen",
+            "clone_target_detail_budget",
+            "clone_effective_detail_budget",
+            "clone_score_ramp_progress",
+        ):
+            if key in ema_time:
+                metrics_to_log["train_clone_score/" + key] = ema_time[key]
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)
@@ -755,6 +810,7 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
                         renderArgs[1],
                         vis_mask,
                         render_gaussian_budget,
+                        iteration=iteration,
                     )
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)

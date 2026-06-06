@@ -80,6 +80,7 @@ class PipelineParams(ParamGroup):
         self.gate_budget_lambda = 0.01
         self.gate_binary_lambda = 0.001
         self.gate_feature_mode = "detail_view"
+        self.detail_feature_mode = "detail_hash"
         self.gate_view_context_dim = 32
         self.gate_opacity_mode = "st_identity"
         self.gate_all_detail_until = 0
@@ -89,6 +90,13 @@ class PipelineParams(ParamGroup):
         self.gate_utility_sample_count = 64
         self.gate_utility_group_size = 8
         self.gate_utility_min_delta = 0.0
+        self.clone_score_warmup_until = 20_000
+        self.clone_score_ramp_until = 40_000
+        self.clone_score_freeze_after = 220_000
+        self.clone_score_ema_beta = 0.95
+        self.clone_score_eps = 1e-6
+        self.clone_score_detail_grad_weight = 1.0
+        self.clone_score_grad_clip = 0.0
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10

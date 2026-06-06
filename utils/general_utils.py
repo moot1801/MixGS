@@ -275,6 +275,7 @@ def get_default_pp():
     pp.gate_budget_lambda = 0.01
     pp.gate_binary_lambda = 0.001
     pp.gate_feature_mode = "detail_view"
+    pp.detail_feature_mode = "detail_hash"
     pp.gate_view_context_dim = 32
     pp.gate_opacity_mode = "st_identity"
     pp.gate_all_detail_until = 0
@@ -292,6 +293,13 @@ def get_default_pp():
     pp.gate_utility_sample_count = 64
     pp.gate_utility_group_size = 8
     pp.gate_utility_min_delta = 0.0
+    pp.clone_score_warmup_until = 20_000
+    pp.clone_score_ramp_until = 40_000
+    pp.clone_score_freeze_after = 220_000
+    pp.clone_score_ema_beta = 0.95
+    pp.clone_score_eps = 1e-6
+    pp.clone_score_detail_grad_weight = 1.0
+    pp.clone_score_grad_clip = 0.0
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
     pp.metric_log_interval = 10_000

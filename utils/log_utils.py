@@ -196,6 +196,16 @@ class TrainingResourceLogger:
         "gate_utility_mean",
         "gate_utility_positive_ratio",
         "gate_utility_eval_time_ms",
+        "clone_score_stage_id",
+        "clone_score_mean",
+        "clone_score_max",
+        "clone_score_updated_count",
+        "clone_score_signal_mean",
+        "clone_score_signal_max",
+        "clone_score_frozen",
+        "clone_target_detail_budget",
+        "clone_effective_detail_budget",
+        "clone_score_ramp_progress",
     ]
     VRAM_FIELDS = [
         "vram_allocated_mb",

@@ -72,6 +72,10 @@ class GSDecoder(nn.Module):
         self.gaussian_rotation = nn.Linear(width, 4)
         self.gaussian_scaling = nn.Linear(width, 3)
         self.gaussian_opacity = nn.Linear(width, 1)
+        if self.max_detail_slots > 1:
+            self.slot_embedding = nn.Embedding(self.max_detail_slots, width)
+        else:
+            self.slot_embedding = None
 
     def compute_routing_feature(self, spatial_h, pose_input, scale_input, rotate_input):
         spatial_h = self.spatial_mlp(spatial_h)
@@ -99,6 +103,9 @@ class GSDecoder(nn.Module):
         return opacity.squeeze(-1) * scale_score
 
     def decode_hidden(self, h, slot_idx=None):
+        if self.slot_embedding is not None and slot_idx is not None and h.shape[0] > 0:
+            slot_idx = slot_idx.to(device=h.device, dtype=torch.long).clamp(min=0, max=self.max_detail_slots - 1)
+            h = h + self.slot_embedding(slot_idx)
         color = self.gaussian_color(h)
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)
