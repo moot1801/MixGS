@@ -68,14 +68,17 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
         if isinstance(camera_center, torch.Tensor):
             while camera_center.dim() > 1:
                 camera_center = camera_center[0]
+        allocation_mode = getattr(pipeline, "allocation_mode", "proposal")
+        allocation_mode_name = str(allocation_mode or "proposal").lower()
         decoded_data = mixgs.step(
             hash_input,
             cam_info['world_view_transform'][0][-1, :-1],
             camera_center=camera_center,
             render_gaussian_budget=render_gaussian_budget,
             scale_min=getattr(pipeline, "scale_min", 0.0),
-            allocation_mode=getattr(pipeline, "allocation_mode", "proposal"),
+            allocation_mode=allocation_mode,
             training=False,
+            iteration=iteration if allocation_mode_name in ("projected_area", "projected_area_score", "area_score") else None,
             gate_train_mode=getattr(pipeline, "gate_train_mode", "soft_all"),
             gate_eval_mode=getattr(pipeline, "gate_eval_mode", "topk"),
             gate_temperature_init=getattr(pipeline, "gate_temperature_init", 1.0),
@@ -94,6 +97,11 @@ def render_set(model_path, name, iteration, gs_dataset, gaussians, mixgs, pipeli
             clone_score_eps=getattr(pipeline, "clone_score_eps", 1e-6),
             clone_score_detail_grad_weight=getattr(pipeline, "clone_score_detail_grad_weight", 1.0),
             clone_score_grad_clip=getattr(pipeline, "clone_score_grad_clip", 0.0),
+            projected_area_all_detail_until=getattr(pipeline, "projected_area_all_detail_until", 50000),
+            projected_area_detail_stage_full_budget=getattr(pipeline, "projected_area_detail_stage_full_budget", True),
+            projected_area_scale_power=getattr(pipeline, "projected_area_scale_power", 2.0),
+            projected_area_distance_power=getattr(pipeline, "projected_area_distance_power", 2.0),
+            projected_area_eps=getattr(pipeline, "projected_area_eps", 1e-6),
         )
         rendering = render_mix(cam_info, gaussians, pipeline, background, vis_mask, decoded_data)
 

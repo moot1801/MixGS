@@ -97,6 +97,11 @@ class PipelineParams(ParamGroup):
         self.clone_score_eps = 1e-6
         self.clone_score_detail_grad_weight = 1.0
         self.clone_score_grad_clip = 0.0
+        self.projected_area_all_detail_until = 50_000
+        self.projected_area_detail_stage_full_budget = True
+        self.projected_area_scale_power = 2.0
+        self.projected_area_distance_power = 2.0
+        self.projected_area_eps = 1e-6
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10

@@ -527,6 +527,146 @@ class MixGSModel:
             rotate_input[anchor_idx],
         )
 
+    @staticmethod
+    def _projected_area_detail_stage_active(iteration, all_detail_until):
+        all_detail_until = int(all_detail_until or 0)
+        if all_detail_until <= 0 or iteration is None:
+            return False
+        return int(iteration) < all_detail_until
+
+    @staticmethod
+    def _projected_area_score_stats(scores):
+        if scores.numel() == 0:
+            return {
+                "projected_area_score_mean": 0.0,
+                "projected_area_score_max": 0.0,
+                "projected_area_score_min": 0.0,
+            }
+        detached = scores.detach()
+        return {
+            "projected_area_score_mean": float(detached.mean().item()),
+            "projected_area_score_max": float(detached.max().item()),
+            "projected_area_score_min": float(detached.min().item()),
+        }
+
+    def _projected_area_scores(
+            self,
+            coords,
+            scale_input,
+            camera_center=None,
+            scale_power=2.0,
+            distance_power=2.0,
+            eps=1e-6,
+    ):
+        eps = max(float(eps or 1e-6), 1e-12)
+        scale = scale_input.detach().to(device=coords.device, dtype=coords.dtype)
+        scale = torch.clamp_min(torch.abs(scale[:, :3]).mean(dim=-1), eps)
+        score = torch.pow(scale, float(scale_power or 0.0))
+        if camera_center is not None:
+            if not isinstance(camera_center, torch.Tensor):
+                camera_center = coords.new_tensor(camera_center)
+            camera_center = camera_center.to(device=coords.device, dtype=coords.dtype)
+            while camera_center.dim() > 1:
+                camera_center = camera_center[0]
+            distance = (coords.detach() - camera_center.unsqueeze(0)).norm(dim=-1).clamp_min(eps)
+            score = score / torch.pow(distance, float(distance_power or 0.0))
+        score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.clamp_min(score, 0.0)
+
+    def _step_projected_area(
+            self,
+            coords,
+            scale_input,
+            rotate_input,
+            offset_slots,
+            pose,
+            render_gaussian_budget=0,
+            iteration=None,
+            camera_center=None,
+            projected_area_all_detail_until=50000,
+            projected_area_detail_stage_full_budget=True,
+            projected_area_scale_power=2.0,
+            projected_area_distance_power=2.0,
+            projected_area_eps=1e-6,
+    ):
+        temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
+        visible_count = coords.shape[0]
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+        slot_count = min(offset_slots.shape[1], self.max_detail_slots)
+        if slot_count <= 0 or visible_count == 0:
+            detail_counts = torch.zeros(visible_count, dtype=torch.long, device=coords.device)
+            budget_stats = {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": visible_count > render_gaussian_budget > 0,
+                "allocation_mode_id": 4.0,
+                "projected_area_stage_id": 1.0,
+                "projected_area_all_detail_active": 0.0,
+                "projected_area_target_detail_budget": 0,
+                "projected_area_effective_detail_budget": 0,
+            }
+            budget_stats.update(self._projected_area_score_stats(coords.new_empty(0)))
+            return self._empty_decoded_data(coords, detail_counts, budget_stats)
+
+        full_detail_budget = visible_count * slot_count
+        target_detail_budget = full_detail_budget if render_gaussian_budget <= 0 else max(render_gaussian_budget - visible_count, 0)
+        target_detail_budget = min(target_detail_budget, full_detail_budget)
+        detail_stage_active = self._projected_area_detail_stage_active(iteration, projected_area_all_detail_until)
+        if render_gaussian_budget <= 0:
+            effective_render_budget = visible_count + full_detail_budget
+        elif detail_stage_active and bool(projected_area_detail_stage_full_budget):
+            effective_render_budget = visible_count + full_detail_budget
+        else:
+            effective_render_budget = render_gaussian_budget
+
+        projected_scores = self._projected_area_scores(
+            coords,
+            scale_input,
+            camera_center=camera_center,
+            scale_power=projected_area_scale_power,
+            distance_power=projected_area_distance_power,
+            eps=projected_area_eps,
+        )
+        allocation_scores = coords.new_ones((visible_count,)) if detail_stage_active else projected_scores
+        detail_counts, budget_stats = self._allocate_detail_counts(allocation_scores, effective_render_budget)
+        budget_stats.update({
+            "allocation_mode_id": 4.0,
+            "projected_area_stage_id": 0.0 if detail_stage_active else 1.0,
+            "projected_area_all_detail_active": float(bool(detail_stage_active)),
+            "projected_area_target_detail_budget": int(target_detail_budget),
+            "projected_area_effective_detail_budget": int(detail_counts.sum().item()),
+        })
+        budget_stats.update(self._projected_area_score_stats(projected_scores))
+
+        anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
+        if anchor_idx.numel() == 0:
+            return self._empty_decoded_data(coords, detail_counts, budget_stats)
+
+        offset_slots = offset_slots[:, :slot_count]
+        detail_h = self._decode_detail_hidden(
+            coords,
+            temporal_h,
+            scale_input,
+            rotate_input,
+            anchor_idx,
+            slot_idx,
+            detail_feature_mode="anchor_slot",
+        )
+        color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
+
+        return {
+            "d_color": color,
+            "d_rotation": rotation,
+            "d_scaling": scaling,
+            "d_opacity": opacity,
+            "detail_anchor_idx": anchor_idx,
+            "detail_slot_idx": slot_idx,
+            "detail_counts": detail_counts,
+            "budget_stats": budget_stats,
+        }
+
     def _step_clone_score(
             self,
             coords,
@@ -1161,6 +1301,11 @@ class MixGSModel:
             clone_score_eps=1e-6,
             clone_score_detail_grad_weight=1.0,
             clone_score_grad_clip=0.0,
+            projected_area_all_detail_until=50000,
+            projected_area_detail_stage_full_budget=True,
+            projected_area_scale_power=2.0,
+            projected_area_distance_power=2.0,
+            projected_area_eps=1e-6,
             detail_feature_mode="detail_hash",
     ):
         coords = data[0]
@@ -1192,6 +1337,22 @@ class MixGSModel:
                 clone_score_eps=clone_score_eps,
                 anchor_indices=anchor_indices,
                 detail_feature_mode=detail_feature_mode,
+            )
+        if mode in ("projected_area", "projected_area_score", "area_score"):
+            return self._step_projected_area(
+                coords,
+                scale_input,
+                rotate_input,
+                offset_slots,
+                pose,
+                render_gaussian_budget=render_gaussian_budget,
+                iteration=iteration,
+                camera_center=camera_center,
+                projected_area_all_detail_until=projected_area_all_detail_until,
+                projected_area_detail_stage_full_budget=projected_area_detail_stage_full_budget,
+                projected_area_scale_power=projected_area_scale_power,
+                projected_area_distance_power=projected_area_distance_power,
+                projected_area_eps=projected_area_eps,
             )
         if mode in ("slot_gate_st", "slot_st_gate", "st_slot_gate"):
             return self._step_slot_gate_st(

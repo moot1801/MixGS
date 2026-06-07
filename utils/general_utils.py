@@ -300,6 +300,11 @@ def get_default_pp():
     pp.clone_score_eps = 1e-6
     pp.clone_score_detail_grad_weight = 1.0
     pp.clone_score_grad_clip = 0.0
+    pp.projected_area_all_detail_until = 50_000
+    pp.projected_area_detail_stage_full_budget = True
+    pp.projected_area_scale_power = 2.0
+    pp.projected_area_distance_power = 2.0
+    pp.projected_area_eps = 1e-6
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
     pp.metric_log_interval = 10_000
