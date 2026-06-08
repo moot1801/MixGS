@@ -47,11 +47,13 @@ class GSDecoder(nn.Module):
             depth=1,
             width=256,
             max_detail_slots=1,
+            use_slot_embedding=False,
     ):
         super(GSDecoder, self).__init__()
         self.depth = depth
         self.width = width
         self.max_detail_slots = max(1, int(max_detail_slots or 1))
+        self.use_slot_embedding = bool(use_slot_embedding)
 
         self.spatial_mlp = nn.Sequential(
             nn.Linear(spatial_in_dim, width),
@@ -72,7 +74,7 @@ class GSDecoder(nn.Module):
         self.gaussian_rotation = nn.Linear(width, 4)
         self.gaussian_scaling = nn.Linear(width, 3)
         self.gaussian_opacity = nn.Linear(width, 1)
-        if self.max_detail_slots > 1:
+        if self.use_slot_embedding and self.max_detail_slots > 1:
             self.slot_embedding = nn.Embedding(self.max_detail_slots, width)
         else:
             self.slot_embedding = None

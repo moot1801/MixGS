@@ -7,15 +7,15 @@ model_params: {
     sh_degree: 3,
     source_path: "data/mill19/rubble-pixsfm/train",
     pretrain_path: "data/coarse_gaussians/rubble_point_cloud.ply",
-    model_path: "output/rubble_projected_area",
+    model_path: "output/rubble_projected2",
     images: "images",
     resolution: 4,
     white_background: False,
     data_device: "cuda",
     eval: True,
     llffhold: None,
-    detail_max_slots: 3,
-    detail_count_choices: [0, 1, 2, 3],
+    detail_max_slots: 5,
+    detail_count_choices: [0, 1, 2, 3, 4, 5],
     hash_args: {
         canonical_num_levels: 32,
         canonical_level_dim: 2,
@@ -26,7 +26,7 @@ model_params: {
     },
     network_args: {
       depth: 1,
-      width: 32,
+      width: 64,
     }
 }
 
@@ -39,9 +39,10 @@ pipeline_params: {
     allocation_mode: "projected_area",
     detail_feature_mode: "anchor_slot",
     use_slot_embedding: True,
-    render_gaussian_budget: -1,
+    render_gaussian_budget: 0,
+    render_gaussian_budget_multiplier: 4,
     projected_area_all_detail_until: 50_000,
-    projected_area_detail_stage_full_budget: True,
+    # Detail and joint stages both use projected allocation with the YAML budget.
     projected_area_scale_power: 2.0,
     projected_area_distance_power: 2.0,
     projected_area_eps: 1e-6,

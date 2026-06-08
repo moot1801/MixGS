@@ -81,6 +81,7 @@ class PipelineParams(ParamGroup):
         self.gate_binary_lambda = 0.001
         self.gate_feature_mode = "detail_view"
         self.detail_feature_mode = "detail_hash"
+        self.use_slot_embedding = False
         self.gate_view_context_dim = 32
         self.gate_opacity_mode = "st_identity"
         self.gate_all_detail_until = 0

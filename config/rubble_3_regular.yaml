@@ -39,6 +39,8 @@ pipeline_params: {
     scale_min: 0.0005,
     # Fixed per-step rasterizer input budget: visible anchors + selected detail Gaussians.
     # If visible anchors exceed this value, no detail Gaussians are generated for that step.
+    detail_feature_mode: "anchor_slot",
+    use_slot_embedding: True,
     render_gaussian_budget: 0,
     render_gaussian_budget_multiplier: 4,
     resource_log_interval: 100,

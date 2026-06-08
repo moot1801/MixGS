@@ -235,6 +235,7 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
         gaussians = getattr(modules, model_config["name"])(dataset.sh_degree, **model_kwargs)
         scene = LargeScene(dataset, gaussians, load_iteration=iteration, load_vq=load_vq, shuffle=False)
 
+        use_slot_embedding = bool(getattr(pipeline, "use_slot_embedding", False))
         mixgs = MixGSModel(
             hash_args=dataset.hash_args,
             net_args=dataset.network_args,
@@ -242,6 +243,7 @@ def render_sets(dataset: ModelParams, opt, iteration: int, pipeline: PipelinePar
             detail_count_choices=detail_count_choices,
             gate_feature_mode=getattr(pipeline, "gate_feature_mode", "detail_view"),
             gate_view_context_dim=getattr(pipeline, "gate_view_context_dim", 32),
+            use_slot_embedding=use_slot_embedding,
         )
         mixgs.load_weights(dataset.model_path, iteration)
         budget_decay_schedule = StageBudgetDecaySchedule(

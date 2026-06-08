@@ -276,6 +276,7 @@ def get_default_pp():
     pp.gate_binary_lambda = 0.001
     pp.gate_feature_mode = "detail_view"
     pp.detail_feature_mode = "detail_hash"
+    pp.use_slot_embedding = False
     pp.gate_view_context_dim = 32
     pp.gate_opacity_mode = "st_identity"
     pp.gate_all_detail_until = 0

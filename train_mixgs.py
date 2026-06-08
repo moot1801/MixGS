@@ -426,6 +426,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     model_kwargs.setdefault("detail_count_choices", detail_count_choices)
     gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_kwargs)
 
+    use_slot_embedding = bool(getattr(pipe, "use_slot_embedding", False))
     mixgs = MixGSModel(
         hash_args=dataset.hash_args,
         net_args=dataset.network_args,
@@ -433,6 +434,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
         detail_count_choices=detail_count_choices,
         gate_feature_mode=getattr(pipe, "gate_feature_mode", "detail_view"),
         gate_view_context_dim=getattr(pipe, "gate_view_context_dim", 32),
+        use_slot_embedding=use_slot_embedding,
     )
     budget_decay_schedule = StageBudgetDecaySchedule(
         pipe,
@@ -748,6 +750,17 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
         ):
             if key in ema_time:
                 metrics_to_log["train_gate/" + key] = ema_time[key]
+        for key in (
+            "projected_area_stage_id",
+            "projected_area_all_detail_active",
+            "projected_area_target_detail_budget",
+            "projected_area_effective_detail_budget",
+            "projected_area_score_mean",
+            "projected_area_score_max",
+            "projected_area_score_min",
+        ):
+            if key in ema_time:
+                metrics_to_log["train_projected_area/" + key] = ema_time[key]
         for key in (
             "clone_score_stage_id",
             "clone_score_mean",

@@ -14,8 +14,8 @@ model_params: {
     data_device: "cuda",
     eval: True,
     llffhold: None, # 83,
-    detail_max_slots: 2,
-    detail_count_choices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    detail_max_slots: 3,
+    detail_count_choices: [0, 1, 2, 3],
     hash_args: {
         canonical_num_levels: 32,
         canonical_level_dim: 2,
@@ -38,7 +38,9 @@ pipeline_params: {
     scale_min: 0.0005,
     # Fixed per-step rasterizer input budget: visible anchors + selected detail Gaussians.
     # If visible anchors exceed this value, no detail Gaussians are generated for that step.
-    render_gaussian_budget: 4194304, # 2^23
+    detail_feature_mode: "anchor_slot",
+    use_slot_embedding: True,
+    render_gaussian_budget: -1, # 2^23
     stage_budget_adjustment: True,
     stage_budget_initial_scale: 0.75,
     stage_budget_min_scale: 0.10,

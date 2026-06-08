@@ -44,6 +44,7 @@ class MixGSModel:
             detail_count_choices=None,
             gate_feature_mode="detail_view",
             gate_view_context_dim=32,
+            use_slot_embedding=False,
     ):
         self.encoder = GSEncoder(**hash_args).cuda()
         self.spatial_dim = self.encoder.canonical_level_dim * self.encoder.canonical_num_levels
@@ -53,6 +54,8 @@ class MixGSModel:
         )
         net_args = dict(net_args)
         net_args["max_detail_slots"] = self.max_detail_slots
+        net_args["use_slot_embedding"] = bool(use_slot_embedding)
+        self.use_slot_embedding = bool(use_slot_embedding)
         self.decoder = GSDecoder(spatial_in_dim=self.spatial_dim, mlp_in_dim=self.mlp_dim, **net_args).cuda()
         self.gate_feature_mode = str(gate_feature_mode or "detail_view").lower()
         self.gate_uses_view_context = self.gate_feature_mode in ("hash_view_context", "view_context")
@@ -588,6 +591,7 @@ class MixGSModel:
             projected_area_scale_power=2.0,
             projected_area_distance_power=2.0,
             projected_area_eps=1e-6,
+            detail_feature_mode="anchor_slot",
     ):
         temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         visible_count = coords.shape[0]
@@ -614,9 +618,8 @@ class MixGSModel:
         target_detail_budget = full_detail_budget if render_gaussian_budget <= 0 else max(render_gaussian_budget - visible_count, 0)
         target_detail_budget = min(target_detail_budget, full_detail_budget)
         detail_stage_active = self._projected_area_detail_stage_active(iteration, projected_area_all_detail_until)
+        # Stage controls optimizer scope only; allocation always follows the YAML budget.
         if render_gaussian_budget <= 0:
-            effective_render_budget = visible_count + full_detail_budget
-        elif detail_stage_active and bool(projected_area_detail_stage_full_budget):
             effective_render_budget = visible_count + full_detail_budget
         else:
             effective_render_budget = render_gaussian_budget
@@ -629,8 +632,7 @@ class MixGSModel:
             distance_power=projected_area_distance_power,
             eps=projected_area_eps,
         )
-        allocation_scores = coords.new_ones((visible_count,)) if detail_stage_active else projected_scores
-        detail_counts, budget_stats = self._allocate_detail_counts(allocation_scores, effective_render_budget)
+        detail_counts, budget_stats = self._allocate_detail_counts(projected_scores, effective_render_budget)
         budget_stats.update({
             "allocation_mode_id": 4.0,
             "projected_area_stage_id": 0.0 if detail_stage_active else 1.0,
@@ -644,7 +646,10 @@ class MixGSModel:
         if anchor_idx.numel() == 0:
             return self._empty_decoded_data(coords, detail_counts, budget_stats)
 
-        offset_slots = offset_slots[:, :slot_count]
+        detail_xyz = None
+        if self._detail_feature_mode(detail_feature_mode) == "detail_hash":
+            offset_slots = offset_slots[:, :slot_count]
+            detail_xyz = coords[anchor_idx] + offset_slots[anchor_idx, slot_idx]
         detail_h = self._decode_detail_hidden(
             coords,
             temporal_h,
@@ -652,7 +657,8 @@ class MixGSModel:
             rotate_input,
             anchor_idx,
             slot_idx,
-            detail_feature_mode="anchor_slot",
+            detail_xyz=detail_xyz,
+            detail_feature_mode=detail_feature_mode,
         )
         color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
 
@@ -1353,6 +1359,7 @@ class MixGSModel:
                 projected_area_scale_power=projected_area_scale_power,
                 projected_area_distance_power=projected_area_distance_power,
                 projected_area_eps=projected_area_eps,
+                detail_feature_mode=detail_feature_mode,
             )
         if mode in ("slot_gate_st", "slot_st_gate", "st_slot_gate"):
             return self._step_slot_gate_st(
