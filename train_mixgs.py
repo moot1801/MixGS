@@ -184,14 +184,30 @@ def _camera_center(viewpoint):
     return center
 
 
-def _visible_hash_input(gaussians, vis_mask):
-    return [
-        gaussians.get_xyz[vis_mask].detach(),
-        gaussians.get_scaling[vis_mask].detach(),
-        gaussians.get_rotation[vis_mask].detach(),
-        gaussians.get_offset_slots[vis_mask].detach(),
-        torch.nonzero(vis_mask, as_tuple=False).flatten().detach(),
+def _is_projected_area_mode(pipe):
+    mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
+    return mode in ("projected_area", "projected_area_score", "area_score")
+
+
+def _visible_cache_value(gaussians, vis_mask, visible_cache, key, tensor):
+    if visible_cache is not None and visible_cache.get(key) is not None:
+        return visible_cache[key]
+    return tensor[vis_mask]
+
+
+def _visible_hash_input(gaussians, vis_mask, visible_cache=None, include_anchor_indices=True):
+    data = [
+        _visible_cache_value(gaussians, vis_mask, visible_cache, "xyz", gaussians.get_xyz).detach(),
+        _visible_cache_value(gaussians, vis_mask, visible_cache, "scaling", gaussians.get_scaling).detach(),
+        _visible_cache_value(gaussians, vis_mask, visible_cache, "rotation", gaussians.get_rotation).detach(),
+        _visible_cache_value(gaussians, vis_mask, visible_cache, "offset_slots", gaussians.get_offset_slots).detach(),
     ]
+    if include_anchor_indices:
+        anchor_indices = visible_cache.get("indices") if visible_cache is not None else None
+        if anchor_indices is None:
+            anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
+        data.append(anchor_indices.detach())
+    return data
 
 
 def _gate_step_kwargs(pipe, iteration=None, training=False):
@@ -227,21 +243,34 @@ def _gate_step_kwargs(pipe, iteration=None, training=False):
 
 def _render_with_allocation_budget(
         viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget,
-        iteration=None, training=False):
-    hash_input = _visible_hash_input(gaussians, vis_mask)
+        iteration=None, training=False, stage_timer=None, visible_cache=None,
+        include_projected_area_stats=True, use_projected_area_optimizations=False):
+    allocation_mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
+    projected_area_mode = _is_projected_area_mode(pipe)
+    optimize_projected_area = projected_area_mode and bool(use_projected_area_optimizations)
+    hash_input = _visible_hash_input(
+        gaussians,
+        vis_mask,
+        visible_cache=visible_cache,
+        include_anchor_indices=not optimize_projected_area,
+    )
     decoded_data = mixgs.step(
         hash_input,
         _camera_pose(viewpoint),
         camera_center=_camera_center(viewpoint),
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
+        include_projected_area_stats=include_projected_area_stats,
+        stage_timer=stage_timer,
+        use_projected_area_optimizations=optimize_projected_area,
         **_gate_step_kwargs(pipe, iteration=iteration, training=training),
     )
-    allocation_mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
     capture_clone_grad = allocation_mode in ("clone_score", "clone_score_allocation") and bool(training)
     if capture_clone_grad:
         freeze_after = int(getattr(pipe, "clone_score_freeze_after", 220000) or 0)
         capture_clone_grad = iteration is None or freeze_after <= 0 or int(iteration) <= freeze_after
+    if stage_timer is not None:
+        stage_timer.start("rendering")
     render_pkg = render_mix(
         viewpoint,
         gaussians,
@@ -250,13 +279,17 @@ def _render_with_allocation_budget(
         vis_mask,
         decoded_data,
         capture_viewspace_grad=capture_clone_grad,
+        visible_cache=visible_cache,
     )
+    if stage_timer is not None:
+        stage_timer.stop("rendering")
     return render_pkg, decoded_data
 
 
 def _render_with_proposal_budget(
         viewpoint, gaussians, mixgs, pipe, background, vis_mask, render_gaussian_budget,
-        iteration=None, training=False):
+        iteration=None, training=False, stage_timer=None, visible_cache=None,
+        include_projected_area_stats=True, use_projected_area_optimizations=False):
     return _render_with_allocation_budget(
         viewpoint,
         gaussians,
@@ -267,6 +300,10 @@ def _render_with_proposal_budget(
         render_gaussian_budget,
         iteration=iteration,
         training=training,
+        stage_timer=stage_timer,
+        visible_cache=visible_cache,
+        include_projected_area_stats=include_projected_area_stats,
+        use_projected_area_optimizations=use_projected_area_optimizations,
     )
 
 

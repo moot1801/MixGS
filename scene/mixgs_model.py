@@ -84,6 +84,84 @@ class MixGSModel:
             quantized = torch.where(counts >= choice, counts.new_full((), choice), quantized)
         return quantized
 
+    def _projected_area_uses_contiguous_choices(self):
+        return self.detail_count_choices == list(range(1, self.max_detail_slots + 1))
+
+    def _allocate_projected_area_counts(self, scores, render_gaussian_budget):
+        if not self._projected_area_uses_contiguous_choices():
+            return self._allocate_detail_counts(scores, render_gaussian_budget)
+
+        visible_count = scores.shape[0]
+        device = scores.device
+        counts = torch.zeros(visible_count, dtype=torch.long, device=device)
+        render_gaussian_budget = int(render_gaussian_budget or 0)
+
+        if visible_count == 0:
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": 0,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": False,
+            }
+
+        if render_gaussian_budget <= 0:
+            detail_count = self.detail_count_choices[0]
+            counts.fill_(detail_count)
+            selected_detail_count = visible_count * detail_count
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": selected_detail_count,
+                "selected_detail_count": selected_detail_count,
+                "budget_overflow": False,
+            }
+
+        detail_budget = max(render_gaussian_budget - visible_count, 0)
+        detail_budget = min(detail_budget, visible_count * self.max_detail_slots)
+        budget_overflow = visible_count > render_gaussian_budget
+        if detail_budget == 0:
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": 0,
+                "selected_detail_count": 0,
+                "budget_overflow": budget_overflow,
+            }
+        if detail_budget == visible_count * self.max_detail_slots:
+            counts.fill_(self.max_detail_slots)
+            return counts, {
+                "render_gaussian_budget": render_gaussian_budget,
+                "visible_anchor_count": visible_count,
+                "detail_budget": detail_budget,
+                "selected_detail_count": detail_budget,
+                "budget_overflow": budget_overflow,
+            }
+
+        scores = torch.clamp_min(scores, 0.0)
+        score_sum = torch.clamp_min(scores.sum(), torch.finfo(scores.dtype).eps)
+        raw_counts = scores / score_sum * detail_budget
+        counts = torch.floor(raw_counts).to(torch.long).clamp(max=self.max_detail_slots)
+
+        remaining = detail_budget - int(counts.sum().item())
+        while remaining > 0:
+            candidate_idx = torch.nonzero(counts < self.max_detail_slots, as_tuple=False).flatten()
+            if candidate_idx.numel() == 0:
+                break
+            take_count = min(remaining, candidate_idx.numel())
+            priorities = raw_counts[candidate_idx] - counts[candidate_idx].to(raw_counts.dtype)
+            chosen = candidate_idx[torch.topk(priorities, k=take_count, largest=True).indices]
+            counts[chosen] += 1
+            remaining -= take_count
+
+        return counts, {
+            "render_gaussian_budget": render_gaussian_budget,
+            "visible_anchor_count": visible_count,
+            "detail_budget": detail_budget,
+            "selected_detail_count": detail_budget - max(remaining, 0),
+            "budget_overflow": budget_overflow,
+        }
+
     def _allocate_detail_counts(self, scores, render_gaussian_budget):
         visible_count = scores.shape[0]
         device = scores.device
@@ -560,19 +638,52 @@ class MixGSModel:
             scale_power=2.0,
             distance_power=2.0,
             eps=1e-6,
+            use_fast_score=True,
     ):
         eps = max(float(eps or 1e-6), 1e-12)
+        scale_power = float(scale_power or 0.0)
+        distance_power = float(distance_power or 0.0)
         scale = scale_input.detach().to(device=coords.device, dtype=coords.dtype)
         scale = torch.clamp_min(torch.abs(scale[:, :3]).mean(dim=-1), eps)
-        score = torch.pow(scale, float(scale_power or 0.0))
+        if not use_fast_score:
+            score = torch.pow(scale, scale_power)
+            if camera_center is not None:
+                if not isinstance(camera_center, torch.Tensor):
+                    camera_center = coords.new_tensor(camera_center)
+                camera_center = camera_center.to(device=coords.device, dtype=coords.dtype)
+                while camera_center.dim() > 1:
+                    camera_center = camera_center[0]
+                distance = (coords.detach() - camera_center.unsqueeze(0)).norm(dim=-1).clamp_min(eps)
+                score = score / torch.pow(distance, distance_power)
+            score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+            return torch.clamp_min(score, 0.0)
+
+        if scale_power == 2.0:
+            score = scale * scale
+        elif scale_power == 1.0:
+            score = scale
+        elif scale_power == 0.0:
+            score = torch.ones_like(scale)
+        else:
+            score = torch.pow(scale, scale_power)
         if camera_center is not None:
             if not isinstance(camera_center, torch.Tensor):
                 camera_center = coords.new_tensor(camera_center)
             camera_center = camera_center.to(device=coords.device, dtype=coords.dtype)
             while camera_center.dim() > 1:
                 camera_center = camera_center[0]
-            distance = (coords.detach() - camera_center.unsqueeze(0)).norm(dim=-1).clamp_min(eps)
-            score = score / torch.pow(distance, float(distance_power or 0.0))
+            delta = coords.detach() - camera_center.unsqueeze(0)
+            if distance_power == 2.0:
+                distance_term = torch.clamp_min((delta * delta).sum(dim=-1), eps * eps)
+            elif distance_power == 1.0:
+                distance_term = delta.norm(dim=-1).clamp_min(eps)
+            elif distance_power == 0.0:
+                distance_term = None
+            else:
+                distance = delta.norm(dim=-1).clamp_min(eps)
+                distance_term = torch.pow(distance, distance_power)
+            if distance_term is not None:
+                score = score / distance_term
         score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.clamp_min(score, 0.0)
 
@@ -592,8 +703,10 @@ class MixGSModel:
             projected_area_distance_power=2.0,
             projected_area_eps=1e-6,
             detail_feature_mode="anchor_slot",
+            include_projected_area_stats=True,
+            stage_timer=None,
+            use_projected_area_optimizations=False,
     ):
-        temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         visible_count = coords.shape[0]
         render_gaussian_budget = int(render_gaussian_budget or 0)
         slot_count = min(offset_slots.shape[1], self.max_detail_slots)
@@ -624,6 +737,8 @@ class MixGSModel:
         else:
             effective_render_budget = render_gaussian_budget
 
+        if stage_timer is not None:
+            stage_timer.start("importance_estimation")
         projected_scores = self._projected_area_scores(
             coords,
             scale_input,
@@ -631,25 +746,46 @@ class MixGSModel:
             scale_power=projected_area_scale_power,
             distance_power=projected_area_distance_power,
             eps=projected_area_eps,
+            use_fast_score=use_projected_area_optimizations,
         )
-        detail_counts, budget_stats = self._allocate_detail_counts(projected_scores, effective_render_budget)
+        if stage_timer is not None:
+            stage_timer.stop("importance_estimation")
+
+        if stage_timer is not None:
+            stage_timer.start("allocation")
+        if use_projected_area_optimizations:
+            detail_counts, budget_stats = self._allocate_projected_area_counts(projected_scores, effective_render_budget)
+        else:
+            detail_counts, budget_stats = self._allocate_detail_counts(projected_scores, effective_render_budget)
         budget_stats.update({
             "allocation_mode_id": 4.0,
             "projected_area_stage_id": 0.0 if detail_stage_active else 1.0,
             "projected_area_all_detail_active": float(bool(detail_stage_active)),
             "projected_area_target_detail_budget": int(target_detail_budget),
-            "projected_area_effective_detail_budget": int(detail_counts.sum().item()),
+            "projected_area_effective_detail_budget": int(budget_stats.get("selected_detail_count", 0)),
         })
-        budget_stats.update(self._projected_area_score_stats(projected_scores))
 
         anchor_idx, slot_idx = self._selected_indices_from_counts(detail_counts)
+        if stage_timer is not None:
+            stage_timer.stop("allocation")
         if anchor_idx.numel() == 0:
-            return self._empty_decoded_data(coords, detail_counts, budget_stats)
+            if include_projected_area_stats:
+                budget_stats.update(self._projected_area_score_stats(projected_scores))
+            decoded = self._empty_decoded_data(coords, detail_counts, budget_stats)
+            if not include_projected_area_stats:
+                decoded["_projected_area_scores"] = projected_scores
+            return decoded
 
+        if stage_timer is not None:
+            stage_timer.start("decoding")
         detail_xyz = None
         if self._detail_feature_mode(detail_feature_mode) == "detail_hash":
             offset_slots = offset_slots[:, :slot_count]
             detail_xyz = coords[anchor_idx] + offset_slots[anchor_idx, slot_idx]
+        if use_projected_area_optimizations:
+            temporal_h = pose.unsqueeze(0).expand(coords.size()[0], -1)
+        else:
+            temporal_h = pose.unsqueeze(0).repeat(coords.size()[0], 1)
         detail_h = self._decode_detail_hidden(
             coords,
             temporal_h,
@@ -661,8 +797,12 @@ class MixGSModel:
             detail_feature_mode=detail_feature_mode,
         )
         color, rotation, scaling, opacity = self.decoder.decode_hidden(detail_h, slot_idx)
+        if stage_timer is not None:
+            stage_timer.stop("decoding")
 
-        return {
+        if include_projected_area_stats:
+            budget_stats.update(self._projected_area_score_stats(projected_scores))
+        decoded = {
             "d_color": color,
             "d_rotation": rotation,
             "d_scaling": scaling,
@@ -672,6 +812,9 @@ class MixGSModel:
             "detail_counts": detail_counts,
             "budget_stats": budget_stats,
         }
+        if not include_projected_area_stats:
+            decoded["_projected_area_scores"] = projected_scores
+        return decoded
 
     def _step_clone_score(
             self,
@@ -1313,6 +1456,9 @@ class MixGSModel:
             projected_area_distance_power=2.0,
             projected_area_eps=1e-6,
             detail_feature_mode="detail_hash",
+            include_projected_area_stats=True,
+            stage_timer=None,
+            use_projected_area_optimizations=False,
     ):
         coords = data[0]
         scale_input = data[1]
@@ -1360,6 +1506,9 @@ class MixGSModel:
                 projected_area_distance_power=projected_area_distance_power,
                 projected_area_eps=projected_area_eps,
                 detail_feature_mode=detail_feature_mode,
+                include_projected_area_stats=include_projected_area_stats,
+                stage_timer=stage_timer,
+                use_projected_area_optimizations=use_projected_area_optimizations,
             )
         if mode in ("slot_gate_st", "slot_st_gate", "st_slot_gate"):
             return self._step_slot_gate_st(

@@ -75,14 +75,40 @@ def render_mix(
         vis_mask,
         decoded_data,
         scaling_modifier=1.0,
-        capture_viewspace_grad=False):
+        capture_viewspace_grad=False,
+        visible_cache=None):
     """
     Render the scene.
 
     Background tensor (bg_color) must be on GPU!
     """
-    ori_xyz = pc.get_xyz[vis_mask].detach()
-    ori_rot = pc.get_rotation[vis_mask].detach()
+    use_visible_cache = visible_cache is not None
+    if use_visible_cache:
+        visible_cache = visible_cache or {}
+        visible_xyz = visible_cache.get("xyz")
+        if visible_xyz is None:
+            visible_xyz = pc.get_xyz[vis_mask]
+        visible_rotation = visible_cache.get("rotation")
+        if visible_rotation is None:
+            visible_rotation = pc.get_rotation[vis_mask]
+        visible_offset_slots = visible_cache.get("offset_slots")
+        if visible_offset_slots is None:
+            visible_offset_slots = pc.get_offset_slots[vis_mask]
+        visible_features = visible_cache.get("features")
+        if visible_features is None:
+            visible_features = pc.get_features[vis_mask]
+        visible_opacity = visible_cache.get("opacity")
+        if visible_opacity is None:
+            visible_opacity = pc.get_opacity[vis_mask]
+        visible_scaling = visible_cache.get("scaling")
+        if visible_scaling is None:
+            visible_scaling = pc.get_scaling[vis_mask]
+
+        ori_xyz = visible_xyz.detach()
+        ori_rot = visible_rotation.detach()
+    else:
+        ori_xyz = pc.get_xyz[vis_mask].detach()
+        ori_rot = pc.get_rotation[vis_mask].detach()
 
     d_scaling = decoded_data["d_scaling"].to(torch.float32)
     d_rotation = decoded_data["d_rotation"].to(torch.float32)
@@ -101,8 +127,11 @@ def render_mix(
         detail_slot_idx = detail_slot_idx.to(device=ori_xyz.device, dtype=torch.long)
 
     if d_scaling.shape[0] > 0:
-        offset_slots = pc.get_offset_slots[vis_mask]
-        means3D = ori_xyz[detail_anchor_idx] + offset_slots[detail_anchor_idx, detail_slot_idx]
+        if use_visible_cache:
+            means3D = ori_xyz[detail_anchor_idx] + visible_offset_slots[detail_anchor_idx, detail_slot_idx]
+        else:
+            offset_slots = pc.get_offset_slots[vis_mask]
+            means3D = ori_xyz[detail_anchor_idx] + offset_slots[detail_anchor_idx, detail_slot_idx]
         rotations = pc.rotation_activation(ori_rot[detail_anchor_idx] + d_rotation)
     else:
         means3D = ori_xyz.new_empty((0, 3))
@@ -110,9 +139,19 @@ def render_mix(
     res_scales = torch.clamp_min(d_scaling, pipe.scale_min)
 
     # color pre compute
-    pc_features = pc.get_features[vis_mask].transpose(1, 2)
+    if use_visible_cache:
+        pc_features = visible_features.transpose(1, 2)
+    else:
+        pc_features = pc.get_features[vis_mask].transpose(1, 2)
     shs_view = pc_features.view(pc_features.shape[0], -1, (pc.max_sh_degree + 1) ** 2)
-    dir_pp = (pc.get_xyz[vis_mask] - viewpoint_camera["camera_center"].repeat(pc_features.shape[0], 1))
+    if use_visible_cache:
+        camera_center = viewpoint_camera["camera_center"]
+        while camera_center.dim() > 1:
+            camera_center = camera_center[0]
+        camera_center = camera_center.to(device=visible_xyz.device, dtype=visible_xyz.dtype)
+        dir_pp = visible_xyz - camera_center.unsqueeze(0)
+    else:
+        dir_pp = (pc.get_xyz[vis_mask] - viewpoint_camera["camera_center"].repeat(pc_features.shape[0], 1))
     dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
     sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
     colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -120,10 +159,16 @@ def render_mix(
     colors_precomp = torch.cat([torch.sigmoid(d_sh), colors_precomp], dim=0)
     opacity = d_opacity
 
-    ori_means3D = pc.get_xyz[vis_mask]
-    ori_opacity = pc.get_opacity[vis_mask]
-    ori_scales = pc.get_scaling[vis_mask]
-    ori_rotations = pc.get_rotation[vis_mask]
+    if use_visible_cache:
+        ori_means3D = visible_xyz
+        ori_opacity = visible_opacity
+        ori_scales = visible_scaling
+        ori_rotations = visible_rotation
+    else:
+        ori_means3D = pc.get_xyz[vis_mask]
+        ori_opacity = pc.get_opacity[vis_mask]
+        ori_scales = pc.get_scaling[vis_mask]
+        ori_rotations = pc.get_rotation[vis_mask]
 
     means3D = torch.cat([means3D, ori_means3D], dim=0)
     opacity = torch.cat([opacity, ori_opacity], dim=0)

@@ -35,6 +35,14 @@ def main(hparams: Namespace) -> None:
 
             distorted = cv2.imread(str(image_path / image_name))
             metadata = torch.load(metadata_path, map_location='cpu')
+            if distorted.shape[0] != metadata['H'] or distorted.shape[1] != metadata['W']:
+                height, width = distorted.shape[:2]
+                target_height, target_width = metadata['H'], metadata['W']
+                assert height >= target_height
+                assert width >= target_width
+                y0 = (height - target_height) // 2
+                x0 = (width - target_width) // 2
+                distorted = distorted[y0:y0 + target_height, x0:x0 + target_width]
             intrinsics = metadata['intrinsics']
             camera_matrix = np.array([[intrinsics[0], 0, intrinsics[2]],
                                       [0, intrinsics[1], intrinsics[3]],
