@@ -334,6 +334,7 @@ def _visible_cache_from_mask(gaussians, vis_mask):
         "rotation": gaussians.get_rotation[vis_mask],
         "offset_slots": gaussians.get_offset_slots[vis_mask],
         "features": gaussians.get_features[vis_mask],
+        "color_dc": gaussians.get_features_dc[vis_mask, 0, :],
         "opacity": gaussians.get_opacity[vis_mask],
     }
 
@@ -342,6 +343,12 @@ def _fill_deferred_projected_stats(mixgs, decoded_data, budget_stats):
     projected_scores = decoded_data.pop("_projected_area_scores", None)
     if projected_scores is not None and "projected_area_score_mean" not in budget_stats:
         budget_stats.update(mixgs._projected_area_score_stats(projected_scores))
+    if (
+            projected_scores is not None
+            and float(budget_stats.get("allocation_mode_id", 0.0)) == 5.0
+            and "projected_complexity_score_mean" not in budget_stats
+    ):
+        budget_stats.update(mixgs._projected_complexity_score_stats(projected_scores))
 
 
 def _write_metrics(path, metrics, filename):

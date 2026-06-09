@@ -153,6 +153,10 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
+    def get_features_dc(self):
+        return self._features_dc
+
+    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 

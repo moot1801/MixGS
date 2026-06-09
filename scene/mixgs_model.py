@@ -630,6 +630,27 @@ class MixGSModel:
             "projected_area_score_min": float(detached.min().item()),
         }
 
+    @staticmethod
+    def _projected_complexity_score_stats(scores):
+        if scores.numel() == 0:
+            return {
+                "projected_complexity_score_mean": 0.0,
+                "projected_complexity_score_max": 0.0,
+                "projected_complexity_score_min": 0.0,
+            }
+        detached = scores.detach()
+        return {
+            "projected_complexity_score_mean": float(detached.mean().item()),
+            "projected_complexity_score_max": float(detached.max().item()),
+            "projected_complexity_score_min": float(detached.min().item()),
+        }
+
+    def _projected_score_stats_for_mode(self, scores, score_mode):
+        stats = self._projected_area_score_stats(scores)
+        if str(score_mode or "area").lower() in ("complexity", "projected_complexity"):
+            stats.update(self._projected_complexity_score_stats(scores))
+        return stats
+
     def _projected_area_scores(
             self,
             coords,
@@ -687,6 +708,194 @@ class MixGSModel:
         score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.clamp_min(score, 0.0)
 
+    @staticmethod
+    def _viewpoint_int(viewpoint_camera, key, default=0):
+        if viewpoint_camera is None or key not in viewpoint_camera:
+            return int(default)
+        value = viewpoint_camera[key]
+        if isinstance(value, torch.Tensor):
+            return int(value.detach().item())
+        return int(value)
+
+    @staticmethod
+    def _viewpoint_tensor(viewpoint_camera, key, device, dtype):
+        if viewpoint_camera is None or key not in viewpoint_camera:
+            return None
+        value = viewpoint_camera[key]
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device=device, dtype=dtype)
+        return torch.as_tensor(value, device=device, dtype=dtype)
+
+    def _projected_complexity_scores(
+            self,
+            coords,
+            scale_input,
+            color_dc,
+            opacity_input,
+            viewpoint_camera=None,
+            camera_center=None,
+            scale_power=2.0,
+            distance_power=2.0,
+            eps=1e-6,
+            tile_size=32,
+            color_weight=0.40,
+            depth_weight=0.30,
+            depth_var_weight=0.20,
+            shape_weight=0.10,
+            area_tau=0.0,
+            large_area_tau=0.0,
+            opacity_power=1.0,
+            use_fast_score=True,
+    ):
+        with torch.no_grad():
+            fallback_scores = self._projected_area_scores(
+                coords,
+                scale_input,
+                camera_center=camera_center,
+                scale_power=scale_power,
+                distance_power=distance_power,
+                eps=eps,
+                use_fast_score=use_fast_score,
+            ).detach().to(dtype=torch.float32)
+            visible_count = coords.shape[0]
+            if visible_count == 0 or color_dc is None or viewpoint_camera is None:
+                return fallback_scores.to(dtype=coords.dtype)
+
+            device = coords.device
+            score_dtype = torch.float32
+            eps = max(float(eps or 1e-6), 1e-12)
+            tile_size = max(1, int(tile_size or 32))
+            image_height = self._viewpoint_int(viewpoint_camera, "image_height", 0)
+            image_width = self._viewpoint_int(viewpoint_camera, "image_width", 0)
+            full_proj = self._viewpoint_tensor(viewpoint_camera, "full_proj_transform", device, score_dtype)
+            if image_height <= 0 or image_width <= 0 or full_proj is None:
+                return fallback_scores.to(dtype=coords.dtype)
+
+            coords_f = coords.detach().to(device=device, dtype=score_dtype)
+            ones = torch.ones((visible_count, 1), device=device, dtype=score_dtype)
+            hom = torch.cat([coords_f, ones], dim=-1)
+            clip = hom @ full_proj
+            w = clip[:, 3]
+            ndc = clip[:, :3] / w.clamp_min(eps).unsqueeze(-1)
+            ndc = torch.nan_to_num(ndc, nan=0.0, posinf=0.0, neginf=0.0)
+            valid_idx = torch.arange(visible_count, device=device)
+
+            pixel_x = torch.floor((ndc[:, 0] + 1.0) * 0.5 * float(image_width)).to(dtype=torch.long)
+            pixel_y = torch.floor((1.0 - ndc[:, 1]) * 0.5 * float(image_height)).to(dtype=torch.long)
+            pixel_x = pixel_x.clamp_(0, image_width - 1)
+            pixel_y = pixel_y.clamp_(0, image_height - 1)
+            tile_w = max(1, (image_width + tile_size - 1) // tile_size)
+            tile_h = max(1, (image_height + tile_size - 1) // tile_size)
+            tile_count = tile_w * tile_h
+            tile_idx = (pixel_y // tile_size) * tile_w + (pixel_x // tile_size)
+            tile_idx_v = tile_idx[valid_idx].clamp_(0, tile_count - 1)
+
+            color = color_dc.detach().to(device=device, dtype=score_dtype)
+            if color.dim() == 3:
+                color = color[:, 0, :]
+            if color.shape[0] != visible_count:
+                return fallback_scores.to(dtype=coords.dtype)
+            color = torch.clamp(color + 0.5, 0.0, 1.0)
+            color_v = color[valid_idx]
+
+            if camera_center is None and viewpoint_camera is not None:
+                camera_center = viewpoint_camera.get("camera_center")
+            if camera_center is not None:
+                if not isinstance(camera_center, torch.Tensor):
+                    camera_center = coords_f.new_tensor(camera_center)
+                camera_center = camera_center.detach().to(device=device, dtype=score_dtype)
+                while camera_center.dim() > 1:
+                    camera_center = camera_center[0]
+                depth = (coords_f - camera_center.unsqueeze(0)).norm(dim=-1)
+            else:
+                view = self._viewpoint_tensor(viewpoint_camera, "world_view_transform", device, score_dtype)
+                if view is not None:
+                    depth = torch.abs((hom @ view)[:, 2])
+                else:
+                    depth = torch.abs(ndc[:, 2])
+            depth_v = depth[valid_idx].clamp_min(eps)
+
+            scale_values = torch.clamp_min(
+                torch.abs(scale_input.detach().to(device=device, dtype=score_dtype)[:, :3]).mean(dim=-1),
+                eps,
+            )
+            scale_v = scale_values[valid_idx]
+
+            counts = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            ones_v = torch.ones_like(depth_v)
+            counts.index_add_(0, tile_idx_v, ones_v)
+            safe_counts = counts.clamp_min(1.0)
+
+            sum_color = torch.zeros((tile_count, 3), device=device, dtype=score_dtype)
+            sum_color.index_add_(0, tile_idx_v, color_v)
+            mean_color = sum_color[tile_idx_v] / safe_counts[tile_idx_v].unsqueeze(-1)
+            color_dev = torch.linalg.vector_norm(color_v - mean_color, dim=-1) / 1.7320508075688772
+
+            sum_depth = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_depth2 = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_depth.index_add_(0, tile_idx_v, depth_v)
+            sum_depth2.index_add_(0, tile_idx_v, depth_v * depth_v)
+            mean_depth_all = sum_depth / safe_counts
+            var_depth_all = torch.clamp_min(sum_depth2 / safe_counts - mean_depth_all * mean_depth_all, 0.0)
+            depth_scale = depth_v.mean().clamp_min(eps)
+            depth_dev = torch.abs(depth_v - mean_depth_all[tile_idx_v]) / depth_scale
+            depth_var = torch.sqrt(var_depth_all[tile_idx_v]) / depth_scale
+
+            sum_scale = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_scale2 = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_scale.index_add_(0, tile_idx_v, scale_v)
+            sum_scale2.index_add_(0, tile_idx_v, scale_v * scale_v)
+            mean_scale_all = sum_scale / safe_counts
+            var_scale_all = torch.clamp_min(sum_scale2 / safe_counts - mean_scale_all * mean_scale_all, 0.0)
+            scale_norm = scale_v.mean().clamp_min(eps)
+            shape_dev = 0.5 * torch.abs(scale_v - mean_scale_all[tile_idx_v]) / scale_norm
+            shape_dev = shape_dev + 0.5 * torch.sqrt(var_scale_all[tile_idx_v]) / scale_norm
+
+            complexity = (
+                float(color_weight or 0.0) * color_dev
+                + float(depth_weight or 0.0) * depth_dev
+                + float(depth_var_weight or 0.0) * depth_var
+                + float(shape_weight or 0.0) * shape_dev
+            )
+            complexity = torch.nan_to_num(complexity, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+            area = fallback_scores.clamp_min(0.0)
+            area_values = area[valid_idx]
+            tau_value = float(area_tau or 0.0)
+            if tau_value <= 0.0:
+                tau = area_values.mean().clamp_min(eps)
+            else:
+                tau = area_values.new_tensor(tau_value).clamp_min(eps)
+            large_tau_value = float(large_area_tau or 0.0)
+            if large_tau_value <= 0.0:
+                large_tau = (tau * 4.0).clamp_min(eps)
+            else:
+                large_tau = area_values.new_tensor(large_tau_value).clamp_min(eps)
+            saturated_area = 1.0 - torch.exp(-area_values / tau)
+            large_area_penalty = torch.rsqrt(1.0 + area_values / large_tau)
+
+            if opacity_input is not None:
+                opacity = opacity_input.detach().to(device=device, dtype=score_dtype).reshape(-1)
+                if opacity.shape[0] == visible_count:
+                    opacity = opacity[valid_idx].clamp(0.0, 1.0)
+                else:
+                    opacity = torch.ones_like(area_values)
+            else:
+                opacity = torch.ones_like(area_values)
+            opacity_power = float(opacity_power or 0.0)
+            if opacity_power == 0.0:
+                opacity_weight = torch.ones_like(opacity)
+            elif opacity_power == 1.0:
+                opacity_weight = opacity
+            else:
+                opacity_weight = torch.pow(opacity.clamp_min(eps), opacity_power)
+
+            score_v = opacity_weight * saturated_area * large_area_penalty * complexity
+            scores = torch.zeros_like(fallback_scores)
+            scores[valid_idx] = torch.nan_to_num(score_v, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+            scores = torch.where(scores.sum() > eps, scores, fallback_scores)
+            return scores.to(dtype=coords.dtype)
+
     def _step_projected_area(
             self,
             coords,
@@ -697,16 +906,31 @@ class MixGSModel:
             render_gaussian_budget=0,
             iteration=None,
             camera_center=None,
+            viewpoint_camera=None,
             projected_area_all_detail_until=50000,
             projected_area_detail_stage_full_budget=True,
             projected_area_scale_power=2.0,
             projected_area_distance_power=2.0,
             projected_area_eps=1e-6,
+            projected_score_mode="area",
+            color_input=None,
+            opacity_input=None,
+            projected_complexity_tile_size=32,
+            projected_complexity_color_weight=0.40,
+            projected_complexity_depth_weight=0.30,
+            projected_complexity_depth_var_weight=0.20,
+            projected_complexity_shape_weight=0.10,
+            projected_complexity_area_tau=0.0,
+            projected_complexity_large_area_tau=0.0,
+            projected_complexity_opacity_power=1.0,
             detail_feature_mode="anchor_slot",
             include_projected_area_stats=True,
             stage_timer=None,
             use_projected_area_optimizations=False,
     ):
+        projected_score_mode = str(projected_score_mode or "area").lower()
+        complexity_mode = projected_score_mode in ("complexity", "projected_complexity")
+        allocation_mode_id = 5.0 if complexity_mode else 4.0
         visible_count = coords.shape[0]
         render_gaussian_budget = int(render_gaussian_budget or 0)
         slot_count = min(offset_slots.shape[1], self.max_detail_slots)
@@ -718,13 +942,13 @@ class MixGSModel:
                 "detail_budget": 0,
                 "selected_detail_count": 0,
                 "budget_overflow": visible_count > render_gaussian_budget > 0,
-                "allocation_mode_id": 4.0,
+                "allocation_mode_id": allocation_mode_id,
                 "projected_area_stage_id": 1.0,
                 "projected_area_all_detail_active": 0.0,
                 "projected_area_target_detail_budget": 0,
                 "projected_area_effective_detail_budget": 0,
             }
-            budget_stats.update(self._projected_area_score_stats(coords.new_empty(0)))
+            budget_stats.update(self._projected_score_stats_for_mode(coords.new_empty(0), projected_score_mode))
             return self._empty_decoded_data(coords, detail_counts, budget_stats)
 
         full_detail_budget = visible_count * slot_count
@@ -739,15 +963,37 @@ class MixGSModel:
 
         if stage_timer is not None:
             stage_timer.start("importance_estimation")
-        projected_scores = self._projected_area_scores(
-            coords,
-            scale_input,
-            camera_center=camera_center,
-            scale_power=projected_area_scale_power,
-            distance_power=projected_area_distance_power,
-            eps=projected_area_eps,
-            use_fast_score=use_projected_area_optimizations,
-        )
+        if complexity_mode:
+            projected_scores = self._projected_complexity_scores(
+                coords,
+                scale_input,
+                color_input,
+                opacity_input,
+                viewpoint_camera=viewpoint_camera,
+                camera_center=camera_center,
+                scale_power=projected_area_scale_power,
+                distance_power=projected_area_distance_power,
+                eps=projected_area_eps,
+                tile_size=projected_complexity_tile_size,
+                color_weight=projected_complexity_color_weight,
+                depth_weight=projected_complexity_depth_weight,
+                depth_var_weight=projected_complexity_depth_var_weight,
+                shape_weight=projected_complexity_shape_weight,
+                area_tau=projected_complexity_area_tau,
+                large_area_tau=projected_complexity_large_area_tau,
+                opacity_power=projected_complexity_opacity_power,
+                use_fast_score=use_projected_area_optimizations,
+            )
+        else:
+            projected_scores = self._projected_area_scores(
+                coords,
+                scale_input,
+                camera_center=camera_center,
+                scale_power=projected_area_scale_power,
+                distance_power=projected_area_distance_power,
+                eps=projected_area_eps,
+                use_fast_score=use_projected_area_optimizations,
+            )
         if stage_timer is not None:
             stage_timer.stop("importance_estimation")
 
@@ -758,7 +1004,7 @@ class MixGSModel:
         else:
             detail_counts, budget_stats = self._allocate_detail_counts(projected_scores, effective_render_budget)
         budget_stats.update({
-            "allocation_mode_id": 4.0,
+            "allocation_mode_id": allocation_mode_id,
             "projected_area_stage_id": 0.0 if detail_stage_active else 1.0,
             "projected_area_all_detail_active": float(bool(detail_stage_active)),
             "projected_area_target_detail_budget": int(target_detail_budget),
@@ -770,7 +1016,7 @@ class MixGSModel:
             stage_timer.stop("allocation")
         if anchor_idx.numel() == 0:
             if include_projected_area_stats:
-                budget_stats.update(self._projected_area_score_stats(projected_scores))
+                budget_stats.update(self._projected_score_stats_for_mode(projected_scores, projected_score_mode))
             decoded = self._empty_decoded_data(coords, detail_counts, budget_stats)
             if not include_projected_area_stats:
                 decoded["_projected_area_scores"] = projected_scores
@@ -801,7 +1047,7 @@ class MixGSModel:
             stage_timer.stop("decoding")
 
         if include_projected_area_stats:
-            budget_stats.update(self._projected_area_score_stats(projected_scores))
+            budget_stats.update(self._projected_score_stats_for_mode(projected_scores, projected_score_mode))
         decoded = {
             "d_color": color,
             "d_rotation": rotation,
@@ -1455,10 +1701,19 @@ class MixGSModel:
             projected_area_scale_power=2.0,
             projected_area_distance_power=2.0,
             projected_area_eps=1e-6,
+            projected_complexity_tile_size=32,
+            projected_complexity_color_weight=0.40,
+            projected_complexity_depth_weight=0.30,
+            projected_complexity_depth_var_weight=0.20,
+            projected_complexity_shape_weight=0.10,
+            projected_complexity_area_tau=0.0,
+            projected_complexity_large_area_tau=0.0,
+            projected_complexity_opacity_power=1.0,
             detail_feature_mode="detail_hash",
             include_projected_area_stats=True,
             stage_timer=None,
             use_projected_area_optimizations=False,
+            viewpoint_camera=None,
     ):
         coords = data[0]
         scale_input = data[1]
@@ -1467,7 +1722,15 @@ class MixGSModel:
             offset_slots = data[3]
         else:
             offset_slots = coords.new_zeros((coords.shape[0], 1, 3))
-        anchor_indices = data[4] if len(data) > 4 else None
+        anchor_indices = None
+        extra_inputs = {}
+        if len(data) > 4:
+            if isinstance(data[4], dict):
+                extra_inputs = data[4]
+            else:
+                anchor_indices = data[4]
+        if len(data) > 5 and isinstance(data[5], dict):
+            extra_inputs = data[5]
         offset_slots = offset_slots.to(device=coords.device, dtype=coords.dtype)
         if anchor_indices is not None:
             anchor_indices = anchor_indices.to(device=coords.device, dtype=torch.long)
@@ -1490,7 +1753,21 @@ class MixGSModel:
                 anchor_indices=anchor_indices,
                 detail_feature_mode=detail_feature_mode,
             )
-        if mode in ("projected_area", "projected_area_score", "area_score"):
+        if mode in (
+                "projected_area",
+                "projected_area_score",
+                "area_score",
+                "projected_complexity",
+                "projected_complexity_score",
+                "complexity_score",
+                "image_complexity",
+        ):
+            projected_score_mode = "complexity" if mode in (
+                "projected_complexity",
+                "projected_complexity_score",
+                "complexity_score",
+                "image_complexity",
+            ) else "area"
             return self._step_projected_area(
                 coords,
                 scale_input,
@@ -1500,11 +1777,23 @@ class MixGSModel:
                 render_gaussian_budget=render_gaussian_budget,
                 iteration=iteration,
                 camera_center=camera_center,
+                viewpoint_camera=viewpoint_camera,
                 projected_area_all_detail_until=projected_area_all_detail_until,
                 projected_area_detail_stage_full_budget=projected_area_detail_stage_full_budget,
                 projected_area_scale_power=projected_area_scale_power,
                 projected_area_distance_power=projected_area_distance_power,
                 projected_area_eps=projected_area_eps,
+                projected_score_mode=projected_score_mode,
+                color_input=extra_inputs.get("color_dc"),
+                opacity_input=extra_inputs.get("opacity"),
+                projected_complexity_tile_size=projected_complexity_tile_size,
+                projected_complexity_color_weight=projected_complexity_color_weight,
+                projected_complexity_depth_weight=projected_complexity_depth_weight,
+                projected_complexity_depth_var_weight=projected_complexity_depth_var_weight,
+                projected_complexity_shape_weight=projected_complexity_shape_weight,
+                projected_complexity_area_tau=projected_complexity_area_tau,
+                projected_complexity_large_area_tau=projected_complexity_large_area_tau,
+                projected_complexity_opacity_power=projected_complexity_opacity_power,
                 detail_feature_mode=detail_feature_mode,
                 include_projected_area_stats=include_projected_area_stats,
                 stage_timer=stage_timer,

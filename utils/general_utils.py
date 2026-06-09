@@ -306,6 +306,14 @@ def get_default_pp():
     pp.projected_area_scale_power = 2.0
     pp.projected_area_distance_power = 2.0
     pp.projected_area_eps = 1e-6
+    pp.projected_complexity_tile_size = 32
+    pp.projected_complexity_color_weight = 0.40
+    pp.projected_complexity_depth_weight = 0.30
+    pp.projected_complexity_depth_var_weight = 0.20
+    pp.projected_complexity_shape_weight = 0.10
+    pp.projected_complexity_area_tau = 0.0
+    pp.projected_complexity_large_area_tau = 0.0
+    pp.projected_complexity_opacity_power = 1.0
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
     pp.metric_log_interval = 10_000

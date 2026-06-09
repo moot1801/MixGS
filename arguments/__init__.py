@@ -103,6 +103,14 @@ class PipelineParams(ParamGroup):
         self.projected_area_scale_power = 2.0
         self.projected_area_distance_power = 2.0
         self.projected_area_eps = 1e-6
+        self.projected_complexity_tile_size = 32
+        self.projected_complexity_color_weight = 0.40
+        self.projected_complexity_depth_weight = 0.30
+        self.projected_complexity_depth_var_weight = 0.20
+        self.projected_complexity_shape_weight = 0.10
+        self.projected_complexity_area_tau = 0.0
+        self.projected_complexity_large_area_tau = 0.0
+        self.projected_complexity_opacity_power = 1.0
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10

@@ -184,9 +184,19 @@ def _camera_center(viewpoint):
     return center
 
 
+def _is_projected_complexity_mode(pipe):
+    mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
+    return mode in (
+        "projected_complexity",
+        "projected_complexity_score",
+        "complexity_score",
+        "image_complexity",
+    )
+
+
 def _is_projected_area_mode(pipe):
     mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
-    return mode in ("projected_area", "projected_area_score", "area_score")
+    return mode in ("projected_area", "projected_area_score", "area_score") or _is_projected_complexity_mode(pipe)
 
 
 def _visible_cache_value(gaussians, vis_mask, visible_cache, key, tensor):
@@ -195,7 +205,12 @@ def _visible_cache_value(gaussians, vis_mask, visible_cache, key, tensor):
     return tensor[vis_mask]
 
 
-def _visible_hash_input(gaussians, vis_mask, visible_cache=None, include_anchor_indices=True):
+def _visible_hash_input(
+        gaussians,
+        vis_mask,
+        visible_cache=None,
+        include_anchor_indices=True,
+        include_projected_complexity_inputs=False):
     data = [
         _visible_cache_value(gaussians, vis_mask, visible_cache, "xyz", gaussians.get_xyz).detach(),
         _visible_cache_value(gaussians, vis_mask, visible_cache, "scaling", gaussians.get_scaling).detach(),
@@ -207,6 +222,20 @@ def _visible_hash_input(gaussians, vis_mask, visible_cache=None, include_anchor_
         if anchor_indices is None:
             anchor_indices = torch.nonzero(vis_mask, as_tuple=False).flatten()
         data.append(anchor_indices.detach())
+    if include_projected_complexity_inputs:
+        color_dc = visible_cache.get("color_dc") if visible_cache is not None else None
+        if color_dc is None and visible_cache is not None and visible_cache.get("features") is not None:
+            color_dc = visible_cache["features"][:, 0, :]
+        if color_dc is None:
+            features_dc = getattr(gaussians, "get_features_dc", None)
+            if features_dc is not None:
+                color_dc = features_dc[vis_mask, 0, :]
+            else:
+                color_dc = gaussians.get_features[vis_mask, 0, :]
+        data.append({
+            "color_dc": color_dc.detach(),
+            "opacity": _visible_cache_value(gaussians, vis_mask, visible_cache, "opacity", gaussians.get_opacity).detach(),
+        })
     return data
 
 
@@ -238,6 +267,14 @@ def _gate_step_kwargs(pipe, iteration=None, training=False):
         "projected_area_scale_power": getattr(pipe, "projected_area_scale_power", 2.0),
         "projected_area_distance_power": getattr(pipe, "projected_area_distance_power", 2.0),
         "projected_area_eps": getattr(pipe, "projected_area_eps", 1e-6),
+        "projected_complexity_tile_size": getattr(pipe, "projected_complexity_tile_size", 32),
+        "projected_complexity_color_weight": getattr(pipe, "projected_complexity_color_weight", 0.40),
+        "projected_complexity_depth_weight": getattr(pipe, "projected_complexity_depth_weight", 0.30),
+        "projected_complexity_depth_var_weight": getattr(pipe, "projected_complexity_depth_var_weight", 0.20),
+        "projected_complexity_shape_weight": getattr(pipe, "projected_complexity_shape_weight", 0.10),
+        "projected_complexity_area_tau": getattr(pipe, "projected_complexity_area_tau", 0.0),
+        "projected_complexity_large_area_tau": getattr(pipe, "projected_complexity_large_area_tau", 0.0),
+        "projected_complexity_opacity_power": getattr(pipe, "projected_complexity_opacity_power", 1.0),
     }
 
 
@@ -247,17 +284,20 @@ def _render_with_allocation_budget(
         include_projected_area_stats=True, use_projected_area_optimizations=False):
     allocation_mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
     projected_area_mode = _is_projected_area_mode(pipe)
+    projected_complexity_mode = _is_projected_complexity_mode(pipe)
     optimize_projected_area = projected_area_mode and bool(use_projected_area_optimizations)
     hash_input = _visible_hash_input(
         gaussians,
         vis_mask,
         visible_cache=visible_cache,
         include_anchor_indices=not optimize_projected_area,
+        include_projected_complexity_inputs=projected_complexity_mode,
     )
     decoded_data = mixgs.step(
         hash_input,
         _camera_pose(viewpoint),
         camera_center=_camera_center(viewpoint),
+        viewpoint_camera=viewpoint,
         render_gaussian_budget=render_gaussian_budget,
         scale_min=getattr(pipe, "scale_min", 0.0),
         include_projected_area_stats=include_projected_area_stats,
@@ -795,6 +835,9 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
             "projected_area_score_mean",
             "projected_area_score_max",
             "projected_area_score_min",
+            "projected_complexity_score_mean",
+            "projected_complexity_score_max",
+            "projected_complexity_score_min",
         ):
             if key in ema_time:
                 metrics_to_log["train_projected_area/" + key] = ema_time[key]
