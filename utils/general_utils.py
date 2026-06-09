@@ -314,6 +314,7 @@ def get_default_pp():
     pp.projected_complexity_area_tau = 0.0
     pp.projected_complexity_large_area_tau = 0.0
     pp.projected_complexity_opacity_power = 1.0
+    pp.projected_inverse_area_tile_size = 4
     pp.resource_log_interval = 0
     pp.resource_plot_on_complete = False
     pp.metric_log_interval = 10_000

@@ -896,6 +896,186 @@ class MixGSModel:
             scores = torch.where(scores.sum() > eps, scores, fallback_scores)
             return scores.to(dtype=coords.dtype)
 
+
+    @staticmethod
+    def _normalize_positive_unit(values, eps=1e-6, scale_multiplier=4.0):
+        values = torch.nan_to_num(values.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        if values.numel() == 0:
+            return values
+        scale = (values.mean().clamp_min(float(eps)) * float(scale_multiplier)).clamp_min(float(eps))
+        return torch.clamp(values / scale, 0.0, 1.0)
+
+    def _projected_inverse_area_visibility_scores(
+            self,
+            coords,
+            scale_input,
+            color_dc,
+            opacity_input,
+            viewpoint_camera=None,
+            camera_center=None,
+            scale_power=2.0,
+            distance_power=2.0,
+            eps=1e-6,
+            tile_size=4,
+            use_fast_score=True,
+    ):
+        with torch.no_grad():
+            fallback_scores = self._projected_area_scores(
+                coords,
+                scale_input,
+                camera_center=camera_center,
+                scale_power=scale_power,
+                distance_power=distance_power,
+                eps=eps,
+                use_fast_score=use_fast_score,
+            ).detach().to(dtype=torch.float32)
+            visible_count = coords.shape[0]
+            if visible_count == 0:
+                return fallback_scores.to(dtype=coords.dtype)
+
+            device = coords.device
+            score_dtype = torch.float32
+            eps = max(float(eps or 1e-6), 1e-12)
+            tile_size = max(1, int(tile_size or 4))
+            image_height = self._viewpoint_int(viewpoint_camera, "image_height", 0)
+            image_width = self._viewpoint_int(viewpoint_camera, "image_width", 0)
+            full_proj = self._viewpoint_tensor(viewpoint_camera, "full_proj_transform", device, score_dtype)
+            if image_height <= 0 or image_width <= 0 or full_proj is None:
+                area_score = 1.0 - torch.exp(-fallback_scores / fallback_scores.mean().clamp_min(eps))
+                return torch.pow((1.0 - area_score).clamp(0.0, 1.0), 2.0).to(dtype=coords.dtype)
+
+            coords_f = coords.detach().to(device=device, dtype=score_dtype)
+            ones = torch.ones((visible_count, 1), device=device, dtype=score_dtype)
+            hom = torch.cat([coords_f, ones], dim=-1)
+            clip = hom @ full_proj
+            w = clip[:, 3]
+            ndc = clip[:, :3] / w.clamp_min(eps).unsqueeze(-1)
+            ndc = torch.nan_to_num(ndc, nan=0.0, posinf=0.0, neginf=0.0)
+
+            pixel_x = torch.floor((ndc[:, 0] + 1.0) * 0.5 * float(image_width)).to(dtype=torch.long)
+            pixel_y = torch.floor((1.0 - ndc[:, 1]) * 0.5 * float(image_height)).to(dtype=torch.long)
+            pixel_x = pixel_x.clamp_(0, image_width - 1)
+            pixel_y = pixel_y.clamp_(0, image_height - 1)
+            tile_w = max(1, (image_width + tile_size - 1) // tile_size)
+            tile_h = max(1, (image_height + tile_size - 1) // tile_size)
+            tile_count = tile_w * tile_h
+            tile_idx = ((pixel_y // tile_size) * tile_w + (pixel_x // tile_size)).clamp_(0, tile_count - 1)
+
+            if color_dc is not None:
+                color = color_dc.detach().to(device=device, dtype=score_dtype)
+                if color.dim() == 3:
+                    color = color[:, 0, :]
+                if color.shape[0] == visible_count:
+                    color = torch.clamp(color + 0.5, 0.0, 1.0)
+                else:
+                    color = coords_f.new_zeros((visible_count, 3))
+            else:
+                color = coords_f.new_zeros((visible_count, 3))
+
+            if opacity_input is not None:
+                opacity = opacity_input.detach().to(device=device, dtype=score_dtype).reshape(-1)
+                if opacity.shape[0] != visible_count:
+                    opacity = torch.ones(visible_count, device=device, dtype=score_dtype)
+                else:
+                    opacity = opacity.clamp(0.0, 1.0)
+            else:
+                opacity = torch.ones(visible_count, device=device, dtype=score_dtype)
+
+            if camera_center is None and viewpoint_camera is not None:
+                camera_center = viewpoint_camera.get("camera_center")
+            if camera_center is not None:
+                if not isinstance(camera_center, torch.Tensor):
+                    camera_center = coords_f.new_tensor(camera_center)
+                camera_center = camera_center.detach().to(device=device, dtype=score_dtype)
+                while camera_center.dim() > 1:
+                    camera_center = camera_center[0]
+                depth = (coords_f - camera_center.unsqueeze(0)).norm(dim=-1).clamp_min(eps)
+            else:
+                view = self._viewpoint_tensor(viewpoint_camera, "world_view_transform", device, score_dtype)
+                if view is not None:
+                    depth = torch.abs((hom @ view)[:, 2]).clamp_min(eps)
+                else:
+                    depth = torch.abs(ndc[:, 2]).clamp_min(eps)
+
+            scale_values = torch.clamp_min(
+                torch.abs(scale_input.detach().to(device=device, dtype=score_dtype)[:, :3]).mean(dim=-1),
+                eps,
+            )
+            area_values = fallback_scores.clamp_min(0.0)
+
+            counts = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            ones_v = torch.ones(visible_count, device=device, dtype=score_dtype)
+            counts.index_add_(0, tile_idx, ones_v)
+            safe_counts = counts.clamp_min(1.0)
+            occupied = (counts > 0).to(dtype=score_dtype)
+            mean_occupied_count = (counts.sum() / occupied.sum().clamp_min(1.0)).clamp_min(1.0)
+            tile_population = counts[tile_idx]
+            density_score = torch.clamp(tile_population / (mean_occupied_count * 3.0).clamp_min(1.0), 0.0, 1.0)
+            high_population = torch.clamp(
+                torch.log1p(tile_population) / torch.log1p((mean_occupied_count * 4.0).clamp_min(1.0)),
+                0.0,
+                1.0,
+            )
+
+            sum_depth = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_depth2 = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_depth.index_add_(0, tile_idx, depth)
+            sum_depth2.index_add_(0, tile_idx, depth * depth)
+            mean_depth = sum_depth / safe_counts
+            var_depth = torch.clamp_min(sum_depth2 / safe_counts - mean_depth * mean_depth, 0.0)
+            depth_std = torch.sqrt(var_depth[tile_idx]) / depth.mean().clamp_min(eps)
+
+            sum_scale = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_scale2 = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_scale.index_add_(0, tile_idx, scale_values)
+            sum_scale2.index_add_(0, tile_idx, scale_values * scale_values)
+            mean_scale = sum_scale / safe_counts
+            var_scale = torch.clamp_min(sum_scale2 / safe_counts - mean_scale * mean_scale, 0.0)
+            scale_std = torch.sqrt(var_scale[tile_idx]) / scale_values.mean().clamp_min(eps)
+
+            sum_area = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_area2 = torch.zeros(tile_count, device=device, dtype=score_dtype)
+            sum_area.index_add_(0, tile_idx, area_values)
+            sum_area2.index_add_(0, tile_idx, area_values * area_values)
+            mean_area = sum_area / safe_counts
+            var_area = torch.clamp_min(sum_area2 / safe_counts - mean_area * mean_area, 0.0)
+            area_std = torch.sqrt(var_area[tile_idx]) / area_values.mean().clamp_min(eps)
+
+            sum_color = torch.zeros((tile_count, 3), device=device, dtype=score_dtype)
+            sum_color2 = torch.zeros((tile_count, 3), device=device, dtype=score_dtype)
+            sum_color.index_add_(0, tile_idx, color)
+            sum_color2.index_add_(0, tile_idx, color * color)
+            mean_color = sum_color / safe_counts.unsqueeze(-1)
+            color_var = torch.clamp_min(sum_color2 / safe_counts.unsqueeze(-1) - mean_color * mean_color, 0.0)
+            color_std = torch.sqrt(color_var[tile_idx].mean(dim=-1).clamp_min(0.0))
+
+            attribute_transition = self._normalize_positive_unit(
+                0.35 * depth_std + 0.20 * scale_std + 0.20 * area_std + 0.25 * color_std,
+                eps=eps,
+                scale_multiplier=4.0,
+            )
+            low_transition = (1.0 - attribute_transition).clamp(0.0, 1.0)
+            large_uniform = (high_population * low_transition).clamp(0.0, 1.0)
+            flat_score = (large_uniform * low_transition * density_score).clamp(0.0, 1.0)
+
+            area_tau = area_values.mean().clamp_min(eps)
+            area_score = 1.0 - torch.exp(-area_values / area_tau)
+            inverse_area = torch.pow((1.0 - area_score).clamp(0.0, 1.0), 2.0)
+
+            visibility_gate = torch.clamp(tile_population, 0.0, 1.0) * torch.clamp(opacity / 0.05, 0.0, 1.0)
+            mid_density = torch.exp(-torch.square((density_score - 0.38) / 0.34))
+            not_overdense = (1.0 - torch.clamp((density_score - 0.78) / 0.22, 0.0, 1.0)).clamp(0.0, 1.0)
+            recoverable_gate = (visibility_gate * (0.30 + 0.70 * mid_density) * (0.35 + 0.65 * not_overdense)).clamp(0.0, 1.0)
+            non_uniform_gate = (0.20 + 0.80 * attribute_transition).clamp(0.0, 1.0)
+            anti_flat = torch.pow((1.0 - flat_score).clamp(0.0, 1.0), 1.5)
+            anti_large = torch.pow((1.0 - large_uniform).clamp(0.0, 1.0), 1.5)
+
+            scores = inverse_area * recoverable_gate * anti_flat * anti_large * non_uniform_gate
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+            fallback_inverse = inverse_area * visibility_gate
+            scores = torch.where(scores.sum() > eps, scores, fallback_inverse)
+            return scores.to(dtype=coords.dtype)
+
     def _step_projected_area(
             self,
             coords,
@@ -923,6 +1103,7 @@ class MixGSModel:
             projected_complexity_area_tau=0.0,
             projected_complexity_large_area_tau=0.0,
             projected_complexity_opacity_power=1.0,
+            projected_inverse_area_tile_size=4,
             detail_feature_mode="anchor_slot",
             include_projected_area_stats=True,
             stage_timer=None,
@@ -930,7 +1111,13 @@ class MixGSModel:
     ):
         projected_score_mode = str(projected_score_mode or "area").lower()
         complexity_mode = projected_score_mode in ("complexity", "projected_complexity")
-        allocation_mode_id = 5.0 if complexity_mode else 4.0
+        inverse_area_mode = projected_score_mode in (
+            "projection_inverse_area_with_visibility_gate",
+            "projected_inverse_area",
+            "inverse_projected_area",
+            "inverse_area_visibility",
+        )
+        allocation_mode_id = 6.0 if inverse_area_mode else (5.0 if complexity_mode else 4.0)
         visible_count = coords.shape[0]
         render_gaussian_budget = int(render_gaussian_budget or 0)
         slot_count = min(offset_slots.shape[1], self.max_detail_slots)
@@ -963,7 +1150,21 @@ class MixGSModel:
 
         if stage_timer is not None:
             stage_timer.start("importance_estimation")
-        if complexity_mode:
+        if inverse_area_mode:
+            projected_scores = self._projected_inverse_area_visibility_scores(
+                coords,
+                scale_input,
+                color_input,
+                opacity_input,
+                viewpoint_camera=viewpoint_camera,
+                camera_center=camera_center,
+                scale_power=projected_area_scale_power,
+                distance_power=projected_area_distance_power,
+                eps=projected_area_eps,
+                tile_size=projected_inverse_area_tile_size,
+                use_fast_score=use_projected_area_optimizations,
+            )
+        elif complexity_mode:
             projected_scores = self._projected_complexity_scores(
                 coords,
                 scale_input,
@@ -1709,6 +1910,7 @@ class MixGSModel:
             projected_complexity_area_tau=0.0,
             projected_complexity_large_area_tau=0.0,
             projected_complexity_opacity_power=1.0,
+            projected_inverse_area_tile_size=4,
             detail_feature_mode="detail_hash",
             include_projected_area_stats=True,
             stage_timer=None,
@@ -1761,13 +1963,24 @@ class MixGSModel:
                 "projected_complexity_score",
                 "complexity_score",
                 "image_complexity",
+                "projection_inverse_area_with_visibility_gate",
+                "projected_inverse_area",
+                "inverse_projected_area",
+                "inverse_area_visibility",
         ):
             projected_score_mode = "complexity" if mode in (
                 "projected_complexity",
                 "projected_complexity_score",
                 "complexity_score",
                 "image_complexity",
-            ) else "area"
+            ) else (
+                "inverse_area_visibility" if mode in (
+                    "projection_inverse_area_with_visibility_gate",
+                    "projected_inverse_area",
+                    "inverse_projected_area",
+                    "inverse_area_visibility",
+                ) else "area"
+            )
             return self._step_projected_area(
                 coords,
                 scale_input,
@@ -1794,6 +2007,7 @@ class MixGSModel:
                 projected_complexity_area_tau=projected_complexity_area_tau,
                 projected_complexity_large_area_tau=projected_complexity_large_area_tau,
                 projected_complexity_opacity_power=projected_complexity_opacity_power,
+                projected_inverse_area_tile_size=projected_inverse_area_tile_size,
                 detail_feature_mode=detail_feature_mode,
                 include_projected_area_stats=include_projected_area_stats,
                 stage_timer=stage_timer,

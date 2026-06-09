@@ -194,9 +194,23 @@ def _is_projected_complexity_mode(pipe):
     )
 
 
+def _is_projected_inverse_area_mode(pipe):
+    mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
+    return mode in (
+        "projection_inverse_area_with_visibility_gate",
+        "projected_inverse_area",
+        "inverse_projected_area",
+        "inverse_area_visibility",
+    )
+
+
 def _is_projected_area_mode(pipe):
     mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
-    return mode in ("projected_area", "projected_area_score", "area_score") or _is_projected_complexity_mode(pipe)
+    return (
+        mode in ("projected_area", "projected_area_score", "area_score")
+        or _is_projected_complexity_mode(pipe)
+        or _is_projected_inverse_area_mode(pipe)
+    )
 
 
 def _visible_cache_value(gaussians, vis_mask, visible_cache, key, tensor):
@@ -275,6 +289,7 @@ def _gate_step_kwargs(pipe, iteration=None, training=False):
         "projected_complexity_area_tau": getattr(pipe, "projected_complexity_area_tau", 0.0),
         "projected_complexity_large_area_tau": getattr(pipe, "projected_complexity_large_area_tau", 0.0),
         "projected_complexity_opacity_power": getattr(pipe, "projected_complexity_opacity_power", 1.0),
+        "projected_inverse_area_tile_size": getattr(pipe, "projected_inverse_area_tile_size", 4),
     }
 
 
@@ -285,13 +300,15 @@ def _render_with_allocation_budget(
     allocation_mode = str(getattr(pipe, "allocation_mode", "proposal") or "proposal").lower()
     projected_area_mode = _is_projected_area_mode(pipe)
     projected_complexity_mode = _is_projected_complexity_mode(pipe)
+    projected_inverse_area_mode = _is_projected_inverse_area_mode(pipe)
+    needs_projected_aux_inputs = projected_complexity_mode or projected_inverse_area_mode
     optimize_projected_area = projected_area_mode and bool(use_projected_area_optimizations)
     hash_input = _visible_hash_input(
         gaussians,
         vis_mask,
         visible_cache=visible_cache,
         include_anchor_indices=not optimize_projected_area,
-        include_projected_complexity_inputs=projected_complexity_mode,
+        include_projected_complexity_inputs=needs_projected_aux_inputs,
     )
     decoded_data = mixgs.step(
         hash_input,

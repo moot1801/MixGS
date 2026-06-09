@@ -111,6 +111,7 @@ class PipelineParams(ParamGroup):
         self.projected_complexity_area_tau = 0.0
         self.projected_complexity_large_area_tau = 0.0
         self.projected_complexity_opacity_power = 1.0
+        self.projected_inverse_area_tile_size = 4
         self.stage_budget_adjustment = False
         self.stage_budget_initial_scale = 0.75
         self.stage_budget_min_scale = 0.10
