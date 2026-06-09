@@ -41,6 +41,25 @@ DEFAULT_METHODS = (
     "projection_harris_corner",
     "projection_laplacian_blob",
     "projection_hybrid_structure",
+    "projection_knn_laplacian",
+    "projection_plane_residual",
+    "projection_multiscale_plane_residual",
+    "projection_depth_layer_boundary",
+    "projection_occlusion_support",
+    "projection_support_gated_complexity",
+    "projection_density_suppressed_curvature",
+    "projection_gain_proxy",
+    "projection_structure_hybrid",
+    "projection_flat_surface_suppressed_boundary",
+    "projection_component_penalized_structure",
+    "projection_object_boundary_gain",
+    "projection_learnable_detail_gain",
+    "projected_area_flat_suppressed",
+    "projection_inverse_common_bias",
+    "projection_hard_reject_flat_dense",
+    "projection_mid_support_anti_flat",
+    "projection_anti_road_water_shadow",
+    "projection_inverse_area_with_visibility_gate",
 )
 
 
@@ -369,6 +388,9 @@ def _build_context(viewpoint, image, cache, tile_size, residual_map=None, build_
         "tile_h": tile_h,
         "tile_count": tile_count,
         "tile_counts": counts,
+        "image_width": int(viewpoint["image_width"]),
+        "image_height": int(viewpoint["image_height"]),
+        "xyz": coords_f,
         "depth": depth,
         "scale_mean": scale_mean,
         "scale_anisotropy": scale_anisotropy,
@@ -378,6 +400,7 @@ def _build_context(viewpoint, image, cache, tile_size, residual_map=None, build_
         "features": features,
         "residual_map": residual_map,
         "projection_proxy": None,
+        "neighbor_proxy": {},
     }
 
 
@@ -627,6 +650,570 @@ def _score_projection_hybrid_structure(ctx):
     )
 
 
+def _projection_neighbor_proxy(ctx, k=24, radius=24.0, eps=1e-6):
+    cache = ctx.setdefault("neighbor_proxy", {})
+    cache_key = (int(k), float(radius))
+    if cache_key in cache:
+        return cache[cache_key]
+
+    depth = ctx["depth"].float()
+    visible_count = int(depth.shape[0])
+    device = depth.device
+    dtype = torch.float32
+    eps = max(float(eps), 1e-12)
+    k = max(1, int(k))
+    radius = max(1.0, float(radius))
+    zeros = torch.zeros_like(depth, dtype=dtype)
+    if visible_count <= 1:
+        proxy = {
+            "valid_ratio": zeros,
+            "density_penalty": torch.ones_like(zeros),
+            "support": zeros,
+            "plane_residual": zeros,
+            "plane_curvature": zeros,
+            "depth_gap": zeros,
+            "depth_range": zeros,
+            "depth_contrast": zeros,
+            "color_contrast": zeros,
+            "scale_contrast": zeros,
+            "area_contrast": zeros,
+            "anisotropy": zeros,
+            "area_weight": torch.ones_like(zeros),
+        }
+        cache[cache_key] = proxy
+        return proxy
+
+    points = torch.stack([ctx["pixel_x"].to(device=device, dtype=dtype), ctx["pixel_y"].to(device=device, dtype=dtype)], dim=-1)
+    xyz = ctx["xyz"].to(device=device, dtype=dtype)
+    color = ctx["color"].to(device=device, dtype=dtype)
+    scale_mean = ctx["scale_mean"].to(device=device, dtype=dtype)
+    projected_area = ctx["projected_area"].to(device=device, dtype=dtype)
+    anisotropy = ctx["scale_anisotropy"].to(device=device, dtype=dtype)
+    opacity = ctx["opacity"].to(device=device, dtype=dtype)
+
+    valid_count = torch.zeros(visible_count, device=device, dtype=dtype)
+    neighbor_radius = torch.full((visible_count,), radius, device=device, dtype=dtype)
+    plane_residual = torch.zeros(visible_count, device=device, dtype=dtype)
+    plane_curvature = torch.zeros_like(plane_residual)
+    depth_gap = torch.zeros_like(plane_residual)
+    depth_range = torch.zeros_like(plane_residual)
+    depth_contrast = torch.zeros_like(plane_residual)
+    color_contrast = torch.zeros_like(plane_residual)
+    scale_contrast = torch.zeros_like(plane_residual)
+    area_contrast = torch.zeros_like(plane_residual)
+
+    image_width = max(1, int(ctx.get("image_width", int(points[:, 0].max().item()) + 1)))
+    image_height = max(1, int(ctx.get("image_height", int(points[:, 1].max().item()) + 1)))
+    cell_size = radius
+    cell_w = max(1, int(math.ceil(float(image_width) / cell_size)))
+    cell_h = max(1, int(math.ceil(float(image_height) / cell_size)))
+    cell_x = torch.floor(points[:, 0] / cell_size).long().clamp_(0, cell_w - 1)
+    cell_y = torch.floor(points[:, 1] / cell_size).long().clamp_(0, cell_h - 1)
+    cell_ids = cell_y * cell_w + cell_x
+
+    order = torch.argsort(cell_ids)
+    sorted_ids = cell_ids[order]
+    unique_ids, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+    cell_to_indices = {}
+    start = 0
+    for cell_id, count in zip(unique_ids.tolist(), counts.tolist()):
+        end = start + int(count)
+        cell_to_indices[int(cell_id)] = order[start:end]
+        start = end
+
+    depth_mean = depth.mean().clamp_min(eps)
+    scale_mean_global = scale_mean.mean().clamp_min(eps)
+    area_mean_global = projected_area.mean().clamp_min(eps)
+
+    for cell_id, anchor_idx in cell_to_indices.items():
+        cx = cell_id % cell_w
+        cy = cell_id // cell_w
+        candidate_parts = []
+        for dy in (-1, 0, 1):
+            ny = cy + dy
+            if ny < 0 or ny >= cell_h:
+                continue
+            for dx in (-1, 0, 1):
+                nx = cx + dx
+                if nx < 0 or nx >= cell_w:
+                    continue
+                part = cell_to_indices.get(int(ny * cell_w + nx))
+                if part is not None:
+                    candidate_parts.append(part)
+        if not candidate_parts:
+            continue
+        candidate_idx = torch.cat(candidate_parts, dim=0)
+        if candidate_idx.numel() <= 1:
+            continue
+
+        dist = torch.cdist(points[anchor_idx], points[candidate_idx])
+        self_mask = candidate_idx.unsqueeze(0) == anchor_idx.unsqueeze(1)
+        dist = dist.masked_fill(self_mask, float("inf"))
+        dist = dist.masked_fill(dist > radius, float("inf"))
+        take = min(k, int(candidate_idx.numel()) - 1)
+        if take <= 0:
+            continue
+        knn_dist, knn_pos = torch.topk(dist, k=take, largest=False)
+        valid = torch.isfinite(knn_dist)
+        neighbor_idx = candidate_idx[knn_pos]
+        valid_f = valid.to(dtype=dtype)
+        local_valid_count = valid_f.sum(dim=1)
+        has_neighbor = local_valid_count > 0.0
+        valid_count[anchor_idx] = local_valid_count
+
+        own_depth = depth[anchor_idx].unsqueeze(1)
+        neighbor_depth_raw = depth[neighbor_idx]
+        neighbor_depth = torch.where(valid, neighbor_depth_raw, own_depth)
+        median_depth = neighbor_depth.median(dim=1).values
+        depth_contrast[anchor_idx] = torch.abs(depth[anchor_idx] - median_depth) / depth_mean
+
+        depth_min_raw = torch.where(valid, neighbor_depth_raw, neighbor_depth_raw.new_full((), float("inf"))).min(dim=1).values
+        depth_max_raw = torch.where(valid, neighbor_depth_raw, neighbor_depth_raw.new_full((), float("-inf"))).max(dim=1).values
+        depth_min = torch.where(has_neighbor, depth_min_raw, depth[anchor_idx])
+        depth_max = torch.where(has_neighbor, depth_max_raw, depth[anchor_idx])
+        depth_range_v = (depth_max - depth_min).clamp_min(0.0) / depth_mean
+        if take > 1:
+            sorted_depth = torch.sort(neighbor_depth, dim=1).values
+            gap = torch.diff(sorted_depth, dim=1).clamp_min(0.0).max(dim=1).values / depth_mean
+        else:
+            gap = torch.zeros_like(depth_range_v)
+        depth_range[anchor_idx] = depth_range_v
+        depth_gap[anchor_idx] = torch.where(has_neighbor, gap, torch.zeros_like(gap))
+
+        own_color = color[anchor_idx].unsqueeze(1).expand(-1, take, -1)
+        neighbor_color = torch.where(valid.unsqueeze(-1), color[neighbor_idx], own_color)
+        median_color = neighbor_color.median(dim=1).values
+        color_contrast[anchor_idx] = torch.linalg.vector_norm(color[anchor_idx] - median_color, dim=-1) / 1.7320508075688772
+
+        own_scale = scale_mean[anchor_idx].unsqueeze(1)
+        neighbor_scale = torch.where(valid, scale_mean[neighbor_idx], own_scale)
+        median_scale = neighbor_scale.median(dim=1).values
+        scale_contrast[anchor_idx] = torch.abs(scale_mean[anchor_idx] - median_scale) / scale_mean_global
+
+        own_area = projected_area[anchor_idx].unsqueeze(1)
+        neighbor_area = torch.where(valid, projected_area[neighbor_idx], own_area)
+        median_area = neighbor_area.median(dim=1).values
+        area_contrast[anchor_idx] = torch.abs(projected_area[anchor_idx] - median_area) / area_mean_global
+
+        neighbor_xyz = xyz[neighbor_idx]
+        own_xyz = xyz[anchor_idx].unsqueeze(1).expand(-1, take, -1)
+        neighbor_xyz = torch.where(valid.unsqueeze(-1), neighbor_xyz, own_xyz)
+        weights = valid_f.unsqueeze(-1)
+        safe_count = local_valid_count.clamp_min(1.0).unsqueeze(-1)
+        neighbor_mean = (neighbor_xyz * weights).sum(dim=1) / safe_count
+        neighbor_mean = torch.where(has_neighbor.unsqueeze(-1), neighbor_mean, xyz[anchor_idx])
+        centered = (neighbor_xyz - neighbor_mean.unsqueeze(1)) * weights
+        cov = torch.matmul(centered.transpose(1, 2), centered) / safe_count.unsqueeze(-1)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        eigvals = torch.clamp_min(eigvals, 0.0)
+        normal = eigvecs[:, :, 0]
+        local_scale = torch.sqrt(eigvals[:, -1]).clamp_min(eps)
+        offset = xyz[anchor_idx] - neighbor_mean
+        residual = torch.abs((offset * normal).sum(dim=-1)) / local_scale
+        curvature = eigvals[:, 0] / eigvals.sum(dim=-1).clamp_min(eps)
+        plane_residual[anchor_idx] = torch.where(has_neighbor, residual, torch.zeros_like(residual))
+        plane_curvature[anchor_idx] = torch.where(has_neighbor, curvature, torch.zeros_like(curvature))
+
+        finite_dist = torch.where(valid, knn_dist, knn_dist.new_full((), radius))
+        neighbor_radius[anchor_idx] = finite_dist.max(dim=1).values.clamp_min(eps)
+
+    valid_ratio = (valid_count / float(k)).clamp(0.0, 1.0)
+    density_penalty = torch.sqrt(neighbor_radius / neighbor_radius.mean().clamp_min(eps)).clamp(0.35, 1.50)
+    support = torch.sqrt(valid_ratio) * torch.clamp(opacity, 0.05, 1.0)
+    area_weight = 0.35 + 0.65 * torch.log1p(_normalize_positive(projected_area))
+    proxy = {
+        "valid_ratio": valid_ratio,
+        "density_penalty": density_penalty,
+        "support": support,
+        "plane_residual": _normalize_positive(plane_residual),
+        "plane_curvature": _normalize_positive(plane_curvature),
+        "depth_gap": _normalize_positive(depth_gap),
+        "depth_range": _normalize_positive(depth_range),
+        "depth_contrast": _normalize_positive(depth_contrast),
+        "color_contrast": _normalize_positive(color_contrast),
+        "scale_contrast": _normalize_positive(scale_contrast),
+        "area_contrast": _normalize_positive(area_contrast),
+        "anisotropy": _normalize_positive(anisotropy),
+        "area_weight": area_weight,
+    }
+    cache[cache_key] = proxy
+    return proxy
+
+
+def _score_projection_knn_laplacian(ctx, k=16, radius=16.0, gamma=1.5, eps=1e-6):
+    proxy = _projection_neighbor_proxy(ctx, k=k, radius=radius, eps=eps)
+    local_contrast = (
+        0.45 * proxy["depth_contrast"]
+        + 0.15 * proxy["color_contrast"]
+        + 0.25 * proxy["scale_contrast"]
+        + 0.15 * proxy["area_contrast"]
+        + 0.10 * proxy["anisotropy"]
+    )
+    score = local_contrast * proxy["density_penalty"] * proxy["area_weight"] * proxy["support"]
+    return _normalize_positive(torch.pow(torch.clamp_min(score, 0.0), float(gamma)))
+
+
+def _score_projection_plane_residual(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0)
+    score = proxy["plane_residual"] * proxy["support"] * proxy["density_penalty"] * proxy["area_weight"]
+    return _normalize_positive(score)
+
+
+def _score_projection_multiscale_plane_residual(ctx):
+    small = _projection_neighbor_proxy(ctx, k=16, radius=16.0)
+    large = _projection_neighbor_proxy(ctx, k=32, radius=40.0)
+    agreement = torch.sqrt((small["plane_residual"] * large["plane_residual"]).clamp_min(0.0))
+    score = agreement * small["support"] * small["density_penalty"] * small["area_weight"]
+    return _normalize_positive(score)
+
+
+def _score_projection_depth_layer_boundary(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0)
+    layer = 0.70 * proxy["depth_gap"] + 0.30 * proxy["depth_contrast"]
+    score = layer * proxy["support"] * proxy["density_penalty"] * (0.5 + 0.5 * proxy["plane_residual"])
+    return _normalize_positive(score)
+
+
+def _score_projection_occlusion_support(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=32, radius=32.0)
+    boundary = 0.65 * proxy["depth_gap"] + 0.20 * proxy["plane_residual"] + 0.15 * proxy["area_contrast"]
+    support_gate = proxy["support"] * proxy["valid_ratio"].clamp(0.0, 1.0)
+    score = boundary * support_gate * proxy["density_penalty"]
+    return _normalize_positive(score)
+
+
+def _score_projection_support_gated_complexity(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0)
+    need = (
+        0.40 * proxy["plane_residual"]
+        + 0.25 * proxy["depth_gap"]
+        + 0.20 * proxy["scale_contrast"]
+        + 0.10 * proxy["anisotropy"]
+        + 0.05 * proxy["color_contrast"]
+    )
+    score = need * proxy["support"] * proxy["density_penalty"] * proxy["area_weight"]
+    return _normalize_positive(score)
+
+
+def _score_projection_density_suppressed_curvature(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0)
+    curvature = (
+        0.45 * proxy["plane_curvature"]
+        + 0.25 * proxy["scale_contrast"]
+        + 0.20 * proxy["plane_residual"]
+        + 0.10 * proxy["area_contrast"]
+    )
+    score = curvature * proxy["support"] * proxy["density_penalty"]
+    return _normalize_positive(score)
+
+
+def _score_projection_gain_proxy(ctx):
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0)
+    need = 0.50 * proxy["plane_residual"] + 0.30 * proxy["depth_gap"] + 0.20 * proxy["scale_contrast"]
+    gain_support = proxy["support"] * proxy["density_penalty"] * proxy["area_weight"]
+    score = torch.pow((need * gain_support).clamp_min(0.0), 1.35)
+    return _normalize_positive(score)
+
+
+def _score_projection_structure_hybrid(ctx):
+    return _normalize_positive(
+        0.25 * _score_projection_gain_proxy(ctx)
+        + 0.20 * _score_projection_plane_residual(ctx)
+        + 0.20 * _score_projection_depth_layer_boundary(ctx)
+        + 0.15 * _score_projection_occlusion_support(ctx)
+        + 0.10 * _score_projection_density_suppressed_curvature(ctx)
+        + 0.10 * _score_projection_multiscale_plane_residual(ctx)
+    )
+
+
+def _projection_large_uniform_surface_confidence(ctx, eps=1e-6):
+    cache = ctx.setdefault("surface_gate", {})
+    if "large_uniform_surface_confidence" in cache:
+        return cache["large_uniform_surface_confidence"]
+
+    tile_idx = ctx["tile_idx"]
+    tile_count = ctx["tile_count"]
+    counts = ctx["tile_counts"].clamp_min(1.0)
+    depth = ctx["depth"].float()
+    scale_mean = ctx["scale_mean"].float()
+    projected_area = ctx["projected_area"].float()
+    color = ctx["color"].float()
+    device = depth.device
+    dtype = depth.dtype
+    eps = max(float(eps), 1e-12)
+
+    depth_var, _, _ = _tile_var(depth, tile_idx, tile_count, fill_value=depth.mean())
+    scale_var, _, _ = _tile_var(scale_mean, tile_idx, tile_count, fill_value=scale_mean.mean())
+    area_var, _, _ = _tile_var(projected_area, tile_idx, tile_count, fill_value=projected_area.mean())
+
+    sum_color = torch.zeros((tile_count, 3), device=device, dtype=dtype)
+    sum_color2 = torch.zeros((tile_count, 3), device=device, dtype=dtype)
+    sum_color.index_add_(0, tile_idx, color)
+    sum_color2.index_add_(0, tile_idx, color * color)
+    mean_color = sum_color / counts.unsqueeze(-1)
+    color_var = (sum_color2 / counts.unsqueeze(-1) - mean_color * mean_color).clamp_min(0.0)
+
+    depth_std = torch.sqrt(depth_var[tile_idx].clamp_min(0.0)) / depth.mean().clamp_min(eps)
+    scale_std = torch.sqrt(scale_var[tile_idx].clamp_min(0.0)) / scale_mean.mean().clamp_min(eps)
+    area_std = torch.sqrt(area_var[tile_idx].clamp_min(0.0)) / projected_area.mean().clamp_min(eps)
+    color_std = torch.sqrt(color_var[tile_idx].mean(dim=-1).clamp_min(0.0))
+
+    local_variation = _normalize_positive(
+        0.30 * depth_std
+        + 0.25 * scale_std
+        + 0.25 * area_std
+        + 0.20 * color_std
+    )
+    high_population = _normalize_positive(torch.log1p(counts))[tile_idx]
+    low_variation = (1.0 - local_variation).clamp(0.0, 1.0)
+    confidence = (high_population * low_variation).clamp(0.0, 1.0)
+    cache["large_uniform_surface_confidence"] = confidence
+    return confidence
+
+
+def _projection_surface_gates(ctx, eps=1e-6):
+    cache = ctx.setdefault("surface_gate", {})
+    if "base_gates" in cache:
+        return cache["base_gates"]
+
+    proxy = _projection_neighbor_proxy(ctx, k=24, radius=24.0, eps=eps)
+    valid_ratio = proxy["valid_ratio"].clamp(0.0, 1.0)
+    support = proxy["support"].clamp(0.0, 1.0)
+    large_uniform = _projection_large_uniform_surface_confidence(ctx, eps=eps)
+
+    attribute_transition = _normalize_positive(
+        0.35 * proxy["depth_gap"]
+        + 0.20 * proxy["scale_contrast"]
+        + 0.20 * proxy["area_contrast"]
+        + 0.15 * proxy["color_contrast"]
+        + 0.10 * proxy["anisotropy"]
+    )
+    boundary_structure = _normalize_positive(
+        0.35 * proxy["depth_gap"]
+        + 0.25 * proxy["plane_residual"]
+        + 0.15 * proxy["plane_curvature"]
+        + 0.15 * proxy["scale_contrast"]
+        + 0.10 * proxy["area_contrast"]
+    )
+
+    planar = (1.0 - proxy["plane_residual"]).clamp(0.0, 1.0) * (1.0 - proxy["plane_curvature"]).clamp(0.0, 1.0)
+    low_transition = (1.0 - attribute_transition).clamp(0.0, 1.0)
+    dense_support = (valid_ratio * torch.clamp(2.0 * support, 0.0, 1.0)).clamp(0.0, 1.0)
+    flat_surface = (planar * low_transition * dense_support).clamp(0.0, 1.0)
+
+    flat_suppression = torch.pow((1.0 - flat_surface).clamp(0.0, 1.0), 3.0)
+    large_suppression = torch.pow((1.0 - large_uniform).clamp(0.0, 1.0), 2.5)
+    sparse_gate = torch.clamp(valid_ratio / 0.25, 0.0, 1.0)
+    mid_support = torch.exp(-torch.square((valid_ratio - 0.55) / 0.35))
+    usable_support = (sparse_gate * (0.35 + 0.65 * mid_support)).clamp(0.0, 1.0)
+
+    gates = {
+        "proxy": proxy,
+        "attribute_transition": attribute_transition,
+        "boundary_structure": boundary_structure,
+        "flat_surface": flat_surface,
+        "large_uniform": large_uniform,
+        "flat_suppression": flat_suppression,
+        "large_suppression": large_suppression,
+        "usable_support": usable_support,
+    }
+    cache["base_gates"] = gates
+    return gates
+
+
+def _score_projection_flat_surface_suppressed_boundary(ctx):
+    gates = _projection_surface_gates(ctx)
+    proxy = gates["proxy"]
+    boundary = _normalize_positive(
+        0.45 * proxy["depth_gap"]
+        + 0.20 * proxy["depth_contrast"]
+        + 0.15 * proxy["scale_contrast"]
+        + 0.10 * proxy["area_contrast"]
+        + 0.10 * proxy["plane_residual"]
+    )
+    score = boundary * gates["flat_suppression"] * (0.25 + 0.75 * gates["usable_support"])
+    return _normalize_positive(score)
+
+
+def _score_projection_component_penalized_structure(ctx):
+    gates = _projection_surface_gates(ctx)
+    proxy = gates["proxy"]
+    structure = _normalize_positive(
+        0.30 * proxy["plane_residual"]
+        + 0.25 * proxy["depth_gap"]
+        + 0.20 * proxy["scale_contrast"]
+        + 0.15 * proxy["anisotropy"]
+        + 0.10 * proxy["color_contrast"]
+    )
+    score = structure * gates["flat_suppression"] * gates["large_suppression"] * gates["usable_support"]
+    return _normalize_positive(score)
+
+
+def _score_projection_object_boundary_gain(ctx):
+    gates = _projection_surface_gates(ctx)
+    proxy = gates["proxy"]
+    depth_boundary = _normalize_positive(0.70 * proxy["depth_gap"] + 0.30 * proxy["depth_contrast"])
+    attribute_boundary = gates["attribute_transition"]
+    objectness = _normalize_positive(
+        0.45 * depth_boundary
+        + 0.25 * attribute_boundary
+        + 0.20 * proxy["scale_contrast"]
+        + 0.10 * proxy["area_contrast"]
+    )
+    score = objectness * gates["flat_suppression"] * torch.sqrt(gates["large_suppression"].clamp_min(0.0))
+    score = score * (0.20 + 0.80 * gates["usable_support"])
+    return _normalize_positive(torch.pow(score.clamp_min(0.0), 1.25))
+
+
+def _score_projection_learnable_detail_gain(ctx):
+    gates = _projection_surface_gates(ctx)
+    proxy = gates["proxy"]
+    learnable_need_proxy = _normalize_positive(
+        0.30 * gates["boundary_structure"]
+        + 0.25 * gates["attribute_transition"]
+        + 0.20 * proxy["plane_curvature"]
+        + 0.15 * proxy["anisotropy"]
+        + 0.10 * proxy["area_contrast"]
+    )
+    gain_gate = gates["usable_support"] * gates["large_suppression"] * torch.pow(gates["flat_suppression"], 1.25)
+    score = torch.pow(learnable_need_proxy.clamp_min(0.0), 1.4) * gain_gate
+    return _normalize_positive(score)
+
+
+def _score_projected_area_flat_suppressed(ctx):
+    gates = _projection_surface_gates(ctx)
+    area = torch.log1p(_normalize_positive(ctx["projected_area"]))
+    transition_gate = 0.15 + 0.85 * gates["attribute_transition"]
+    score = area * torch.pow(gates["flat_suppression"], 1.5) * torch.pow(gates["large_suppression"], 1.25) * transition_gate
+    return _normalize_positive(score)
+
+
+def _projection_inverse_bias_terms(ctx, eps=1e-6):
+    cache = ctx.setdefault("inverse_bias", {})
+    if "terms" in cache:
+        return cache["terms"]
+
+    gates = _projection_surface_gates(ctx, eps=eps)
+    proxy = gates["proxy"]
+    color = ctx["color"].float().clamp(0.0, 1.0)
+    opacity = ctx["opacity"].float().clamp(0.0, 1.0)
+    eps = max(float(eps), 1e-12)
+
+    area_score = _normalize_positive(torch.log1p(_normalize_positive(ctx["projected_area"])))
+    density_score = proxy["valid_ratio"].clamp(0.0, 1.0)
+    support_score = _normalize_positive(proxy["support"])
+    flat_score = gates["flat_surface"].clamp(0.0, 1.0)
+    large_uniform = gates["large_uniform"].clamp(0.0, 1.0)
+    low_transition = (1.0 - gates["attribute_transition"]).clamp(0.0, 1.0)
+
+    luminance = (0.2126 * color[:, 0] + 0.7152 * color[:, 1] + 0.0722 * color[:, 2]).clamp(0.0, 1.0)
+    dark_score = torch.pow((1.0 - luminance).clamp(0.0, 1.0), 1.25)
+    chroma = torch.linalg.vector_norm(color - color.mean(dim=-1, keepdim=True), dim=-1) / 0.816496580927726
+    low_chroma = (1.0 - _normalize_positive(chroma)).clamp(0.0, 1.0)
+
+    common_bias = (
+        0.24 * area_score
+        + 0.20 * density_score
+        + 0.16 * support_score
+        + 0.24 * flat_score
+        + 0.16 * large_uniform
+    ).clamp(0.0, 1.0)
+
+    road_water_shadow_bias = (
+        flat_score
+        * (0.35 + 0.65 * large_uniform)
+        * (
+            0.34 * low_transition
+            + 0.24 * low_chroma
+            + 0.20 * dark_score
+            + 0.22 * area_score
+        ).clamp(0.0, 1.0)
+    ).clamp(0.0, 1.0)
+
+    visibility_gate = torch.clamp(density_score / 0.08, 0.0, 1.0) * torch.clamp(opacity / 0.05, 0.0, 1.0)
+    mid_density = torch.exp(-torch.square((density_score - 0.38) / 0.34))
+    not_overdense = (1.0 - torch.clamp((density_score - 0.78) / 0.22, 0.0, 1.0)).clamp(0.0, 1.0)
+    recoverable_gate = (visibility_gate * (0.30 + 0.70 * mid_density) * (0.35 + 0.65 * not_overdense)).clamp(0.0, 1.0)
+    non_uniform_gate = (0.20 + 0.80 * gates["attribute_transition"]).clamp(0.0, 1.0)
+    inverse_area = torch.pow((1.0 - area_score).clamp(0.0, 1.0), 2.0)
+
+    terms = {
+        "gates": gates,
+        "proxy": proxy,
+        "area_score": area_score,
+        "density_score": density_score,
+        "support_score": support_score,
+        "flat_score": flat_score,
+        "large_uniform": large_uniform,
+        "low_transition": low_transition,
+        "dark_score": dark_score,
+        "low_chroma": low_chroma,
+        "common_bias": common_bias,
+        "road_water_shadow_bias": road_water_shadow_bias,
+        "visibility_gate": visibility_gate,
+        "mid_density": mid_density,
+        "not_overdense": not_overdense,
+        "recoverable_gate": recoverable_gate,
+        "non_uniform_gate": non_uniform_gate,
+        "inverse_area": inverse_area,
+    }
+    cache["terms"] = terms
+    return terms
+
+
+def _score_projection_inverse_common_bias(ctx):
+    terms = _projection_inverse_bias_terms(ctx)
+    inverse_bias = torch.pow((1.0 - terms["common_bias"]).clamp(0.0, 1.0), 3.0)
+    score = inverse_bias * terms["recoverable_gate"] * terms["non_uniform_gate"]
+    return _normalize_positive(score)
+
+
+def _score_projection_hard_reject_flat_dense(ctx):
+    terms = _projection_inverse_bias_terms(ctx)
+    flat = terms["flat_score"]
+    dense = terms["density_score"]
+    area = terms["area_score"]
+    large = terms["large_uniform"]
+    low_transition = terms["low_transition"]
+
+    flat_thr = torch.quantile(flat, 0.70).clamp_min(0.25)
+    dense_thr = torch.quantile(dense, 0.70).clamp_min(0.25)
+    area_thr = torch.quantile(area, 0.70).clamp_min(0.20)
+    large_thr = torch.quantile(large, 0.70).clamp_min(0.20)
+    reject = ((flat > flat_thr) & (dense > dense_thr) & (area > area_thr)) | ((large > large_thr) & (flat > flat_thr) & (low_transition > 0.45))
+    keep_gate = torch.where(reject, torch.full_like(flat, 0.02), torch.ones_like(flat))
+
+    base = torch.pow((1.0 - terms["common_bias"]).clamp(0.0, 1.0), 2.0)
+    structure_gate = 0.25 + 0.75 * terms["non_uniform_gate"]
+    score = base * keep_gate * terms["recoverable_gate"] * structure_gate
+    return _normalize_positive(score)
+
+
+def _score_projection_mid_support_anti_flat(ctx):
+    terms = _projection_inverse_bias_terms(ctx)
+    anti_flat = torch.pow((1.0 - terms["flat_score"]).clamp(0.0, 1.0), 3.0)
+    anti_large = torch.pow((1.0 - terms["large_uniform"]).clamp(0.0, 1.0), 2.0)
+    score = terms["mid_density"] * anti_flat * anti_large * terms["visibility_gate"] * terms["non_uniform_gate"]
+    return _normalize_positive(score)
+
+
+def _score_projection_anti_road_water_shadow(ctx):
+    terms = _projection_inverse_bias_terms(ctx)
+    anti_region = torch.pow((1.0 - terms["road_water_shadow_bias"]).clamp(0.0, 1.0), 4.0)
+    inverse_common = torch.pow((1.0 - terms["common_bias"]).clamp(0.0, 1.0), 1.5)
+    structure = 0.20 + 0.80 * terms["non_uniform_gate"]
+    score = anti_region * inverse_common * terms["recoverable_gate"] * structure
+    return _normalize_positive(score)
+
+
+def _score_projection_inverse_area_with_visibility_gate(ctx):
+    terms = _projection_inverse_bias_terms(ctx)
+    anti_flat = torch.pow((1.0 - terms["flat_score"]).clamp(0.0, 1.0), 1.5)
+    anti_large = torch.pow((1.0 - terms["large_uniform"]).clamp(0.0, 1.0), 1.5)
+    score = terms["inverse_area"] * terms["recoverable_gate"] * anti_flat * anti_large * terms["non_uniform_gate"]
+    return _normalize_positive(score)
+
+
 SCORE_FNS = {
     "projected_area": _score_projected_area,
     "tile_complexity": _score_tile_complexity,
@@ -645,6 +1232,25 @@ SCORE_FNS = {
     "projection_harris_corner": _score_projection_harris_corner,
     "projection_laplacian_blob": _score_projection_laplacian_blob,
     "projection_hybrid_structure": _score_projection_hybrid_structure,
+    "projection_knn_laplacian": _score_projection_knn_laplacian,
+    "projection_plane_residual": _score_projection_plane_residual,
+    "projection_multiscale_plane_residual": _score_projection_multiscale_plane_residual,
+    "projection_depth_layer_boundary": _score_projection_depth_layer_boundary,
+    "projection_occlusion_support": _score_projection_occlusion_support,
+    "projection_support_gated_complexity": _score_projection_support_gated_complexity,
+    "projection_density_suppressed_curvature": _score_projection_density_suppressed_curvature,
+    "projection_gain_proxy": _score_projection_gain_proxy,
+    "projection_structure_hybrid": _score_projection_structure_hybrid,
+    "projection_flat_surface_suppressed_boundary": _score_projection_flat_surface_suppressed_boundary,
+    "projection_component_penalized_structure": _score_projection_component_penalized_structure,
+    "projection_object_boundary_gain": _score_projection_object_boundary_gain,
+    "projection_learnable_detail_gain": _score_projection_learnable_detail_gain,
+    "projected_area_flat_suppressed": _score_projected_area_flat_suppressed,
+    "projection_inverse_common_bias": _score_projection_inverse_common_bias,
+    "projection_hard_reject_flat_dense": _score_projection_hard_reject_flat_dense,
+    "projection_mid_support_anti_flat": _score_projection_mid_support_anti_flat,
+    "projection_anti_road_water_shadow": _score_projection_anti_road_water_shadow,
+    "projection_inverse_area_with_visibility_gate": _score_projection_inverse_area_with_visibility_gate,
 }
 
 IMAGE_FEATURE_METHODS = {
